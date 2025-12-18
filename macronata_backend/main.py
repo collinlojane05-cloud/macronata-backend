@@ -12,8 +12,8 @@ load_dotenv()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
-# FIX 1: Revert to the STABLE model name
-model = genai.GenerativeModel("gemini-1.5-flash")
+# LOCKED IN: User specified model name
+model = genai.GenerativeModel("gemini-flash-latest")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -51,9 +51,8 @@ def chat_with_tinny(request: ChatRequest):
         response = model.generate_content(request.message)
         return {"reply": response.text}
     except Exception as e:
-        # FIX 2: Print the REAL error to the Render Console so we can debug
         print(f"TINNY CRASHED: {e}") 
-        return {"reply": "I am having trouble connecting to my brain right now. Please check the server logs."}
+        return {"reply": "Connection error. Please check server logs for API Key issues."}
 
 @app.post("/book_session")
 def book_session(booking: BookingRequest):
