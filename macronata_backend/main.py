@@ -20,15 +20,14 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI()
 
 # --- STRICT DATA MODELS ---
-# We update this to match your new database columns exactly
 class ChatRequest(BaseModel):
     message: str
 
 class BookingRequest(BaseModel):
     tutor_id: str
     learner_id: str
-    scheduled_time: str  # We receive "2025-12-18T15:30"
-    total_cost_zar: float # RENAMED: Matches your database column
+    scheduled_time: str
+    total_cost_zar: float
 
 # --- ENDPOINTS ---
 
@@ -39,7 +38,6 @@ def home():
 @app.get("/tutors")
 def get_tutors():
     try:
-        # Fetch tutors (users with role 'tutor')
         response = supabase.table("users").select("*").eq("role", "tutor").execute()
         return response.data
     except Exception as e:
@@ -56,23 +54,32 @@ def chat_with_tinny(request: ChatRequest):
 @app.post("/book_session")
 def book_session(booking: BookingRequest):
     try:
-        # 1. Parse the date string into a real Timestamp for Postgres
-        # This converts "2025-12-18T15:30" into a format the database loves
         dt_object = datetime.fromisoformat(booking.scheduled_time)
         
-        # 2. Prepare the payload with STRICT keys
         data = {
             "tutor_id": booking.tutor_id,
             "learner_id": booking.learner_id,
             "scheduled_time": dt_object.isoformat(), 
-            "status": "booked",            # This MUST exist in your 'statuses' table
-            "total_cost_zar": booking.total_cost_zar # Matches column name
+            "status": "booked",
+            "total_cost_zar": booking.total_cost_zar
         }
         
-        # 3. Insert into the new table
         response = supabase.table("sessions").insert(data).execute()
         return {"message": "Session booked successfully!", "data": response.data[0]}
     except Exception as e:
-        print(f"DATABASE ERROR: {e}") # This prints to your terminal for debugging
+        print(f"DATABASE ERROR: {e}")
         raise HTTPException(status_code=500, detail=f"Database Rejection: {str(e)}")
+
+# --- NEW ENDPOINT: BOOKING HISTORY ---
+@app.get("/my_bookings/{learner_id}")
+def get_my_bookings(learner_id: str):
+    try:
+        # We select all columns from sessions AND join with users to get the tutor's full name
+        response = supabase.table("sessions").select(
+            "*, tutor:users!tutor_id(full_name)"
+        ).eq("learner_id", learner_id).order("scheduled_time").execute()
+        
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     
