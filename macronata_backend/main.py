@@ -1,142 +1,133 @@
 from fastapi import FastAPI, HTTPException
-from supabase import create_client, Client
-import os
-from dotenv import load_dotenv
 from pydantic import BaseModel
 import google.generativeai as genai
+import os
+from dotenv import load_dotenv
+from supabase import create_client, Client
 from datetime import datetime
 
-# 1. Load environment variables
+# 1. Load Environment Variables
 load_dotenv()
 
-# 2. Initialize Supabase Client
-url: str = os.environ.get("SUPABASE_URL")
-key: str = os.environ.get("SUPABASE_KEY")
-supabase: Client = create_client(url, key)
+# 2. Setup Google AI (Tinny)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
 
-# 3. Initialize Google Gemini (Tinny)
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-
+# Tinny's Personality
 TINNY_INSTRUCTIONS = """
-Role: You are Tinny, the AI tutor for Macronata Academy.
-Context: You are tutoring South African students (CAPS and IEB curriculum).
-Personality: Patient, encouraging, and clear. Use local context (e.g., Rands for money, SA cities).
+You are Tinny, a warm and encouraging AI tutor for South African school kids (CAPS & IEB curriculum).
+- You speak English with South African flair (use 'shame', 'lekker', 'howzit' naturally).
+- You NEVER do the homework for the student. You guide them.
+- If asked to write an essay, ask guiding questions instead.
+- Keep answers short, punchy, and helpful.
 """
 
+# Use the model that works for you (Switch to 'gemini-flash-latest' if needed)
 model = genai.GenerativeModel(
     model_name="gemini-flash-latest",
     system_instruction=TINNY_INSTRUCTIONS
 )
 
-# 4. Initialize FastAPI App
-app = FastAPI(title="Macronata Academy API")
+# 3. Setup Supabase (Database)
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# 4. Initialize the App
+app = FastAPI()
 
 # --- DATA MODELS ---
-class UserSignup(BaseModel):
-    email: str
-    password: str
-    full_name: str
-    role: str
-
 class ChatRequest(BaseModel):
     message: str
 
-class BookSessionRequest(BaseModel):
+class BookingRequest(BaseModel):
     tutor_id: str
     learner_id: str
-    scheduled_time: str  # e.g., "2025-12-20T14:00:00"
+    scheduled_time: datetime
     total_cost_zar: float
 
-class CompleteSessionRequest(BaseModel):
+class SessionCompleteRequest(BaseModel):
     session_id: str
 
-# --- ROUTES ---
+# --- ENDPOINTS ---
 
 @app.get("/")
-def read_root():
+def home():
     return {"message": "Macronata Academy Money Engine is Online!"}
 
-# 1. REGISTER USER
-@app.post("/register")
-def register_user(user: UserSignup):
-    auth_response = supabase.auth.sign_up({
-        "email": user.email,
-        "password": user.password,
-    })
-    if not auth_response.user:
-         raise HTTPException(status_code=400, detail="Registration failed")
-    
-    data = {
-        "id": auth_response.user.id,
-        "email": user.email,
-        "full_name": user.full_name,
-        "role": user.role
-    }
-    try:
-        response = supabase.table("users").insert(data).execute()
-        return {"message": "User registered successfully", "user": response.data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# 2. CHAT WITH TINNY
+# 1. AI Chat Endpoint
 @app.post("/chat")
 def chat_with_tinny(request: ChatRequest):
     try:
         response = model.generate_content(request.message)
         return {"reply": response.text}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI Error: {str(e)}")
+        # Fallback if AI fails (e.g. Quota issues)
+        return {"reply": "Eish! My brain is a bit slow right now. Try again later."}
 
-# 3. BOOK A SESSION (New!)
+# 2. Booking Endpoint
 @app.post("/book_session")
-def book_session(request: BookSessionRequest):
-    data = {
-        "tutor_id": request.tutor_id,
-        "learner_id": request.learner_id,
-        "scheduled_time": request.scheduled_time,
-        "total_cost_zar": request.total_cost_zar,
-        "status": "confirmed"
-    }
+def book_session(booking: BookingRequest):
     try:
+        data = {
+            "tutor_id": booking.tutor_id,
+            "learner_id": booking.learner_id,
+            "scheduled_time": booking.scheduled_time.isoformat(),
+            "status": "booked",
+            "total_cost": booking.total_cost_zar
+        }
+        # Insert into Supabase 'sessions' table
         response = supabase.table("sessions").insert(data).execute()
-        return {"message": "Session Booked!", "session": response.data}
+        return {"message": "Session booked successfully!", "data": response.data[0]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# 4. COMPLETE SESSION & PAYOUT (The Money Engine!)
+# 3. Payout Endpoint (The Money Engine)
 @app.post("/complete_session")
-def complete_session(request: CompleteSessionRequest):
-    # Step A: Get the session details to find the cost
+def complete_session(request: SessionCompleteRequest):
     try:
-        session_data = supabase.table("sessions").select("*").eq("id", request.session_id).single().execute()
-        session = session_data.data
+        # 1. Get the session details
+        session_response = supabase.table("sessions").select("*").eq("id", request.session_id).execute()
         
-        # Step B: Calculate the Commission (15%)
-        total = float(session['total_cost_zar'])
-        platform_fee = total * 0.15
-        tutor_payout = total * 0.85
+        if not session_response.data:
+            raise HTTPException(status_code=404, detail="Session not found")
         
-        # Step C: Record the Transaction
+        session = session_response.data[0]
+        total_amount = session['total_cost']
+        
+        # 2. Calculate the split (85% to Tutor, 15% to Macronata)
+        tutor_share = total_amount * 0.85
+        macronata_share = total_amount * 0.15
+        
+        # 3. Record the Transaction
         transaction_data = {
             "session_id": request.session_id,
-            "total_amount": total,
-            "platform_fee": platform_fee,   # This is your profit
-            "tutor_payout": tutor_payout    # This goes to the student
+            "amount_paid": total_amount,
+            "macronata_revenue": macronata_share,
+            "tutor_earnings": tutor_share,
+            "payout_status": "pending"
         }
-        supabase.table("transactions").insert(transaction_data).execute()
-
-        # Step D: Mark session as Completed
-        supabase.table("sessions").update({"status": "completed"}).eq("id", request.session_id).execute()
+        
+        tx_response = supabase.table("transactions").insert(transaction_data).execute()
         
         return {
-            "message": "Session completed and funds split.",
-            "financials": {
-                "total": total,
-                "macronata_revenue": platform_fee,
-                "tutor_earnings": tutor_payout
-            }
+            "message": "Payout calculated",
+            "total": total_amount,
+            "macronata_revenue": macronata_share,
+            "tutor_earnings": tutor_share
         }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
+# 4. NEW: Get Tutors (Marketplace Endpoint)
+@app.get("/tutors")
+def get_tutors():
+    """Fetches a list of all available tutors from Supabase."""
+    try:
+        # Query users where the role is 'tutor'
+        response = supabase.table("users").select("*").eq("role", "tutor").execute()
+        return response.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
