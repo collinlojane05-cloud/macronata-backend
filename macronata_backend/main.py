@@ -11,7 +11,9 @@ load_dotenv()
 # --- SETUP ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+
+# UPDATED: Using the latest experimental version for maximum speed/smarts
+model = genai.GenerativeModel("gemini-1.5-flash-latest")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -54,8 +56,10 @@ def chat_with_tinny(request: ChatRequest):
 @app.post("/book_session")
 def book_session(booking: BookingRequest):
     try:
+        # 1. Parse Timestamp
         dt_object = datetime.fromisoformat(booking.scheduled_time)
         
+        # 2. Strict Payload
         data = {
             "tutor_id": booking.tutor_id,
             "learner_id": booking.learner_id,
@@ -64,22 +68,31 @@ def book_session(booking: BookingRequest):
             "total_cost_zar": booking.total_cost_zar
         }
         
+        # 3. Insert
         response = supabase.table("sessions").insert(data).execute()
         return {"message": "Session booked successfully!", "data": response.data[0]}
     except Exception as e:
         print(f"DATABASE ERROR: {e}")
         raise HTTPException(status_code=500, detail=f"Database Rejection: {str(e)}")
 
-# --- NEW ENDPOINT: BOOKING HISTORY ---
+# --- LEARNER HISTORY ---
 @app.get("/my_bookings/{learner_id}")
 def get_my_bookings(learner_id: str):
     try:
-        # We select all columns from sessions AND join with users to get the tutor's full name
         response = supabase.table("sessions").select(
             "*, tutor:users!tutor_id(full_name)"
         ).eq("learner_id", learner_id).order("scheduled_time").execute()
-        
         return response.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+# --- TUTOR DASHBOARD ---
+@app.get("/tutor_bookings/{tutor_id}")
+def get_tutor_bookings(tutor_id: str):
+    try:
+        response = supabase.table("sessions").select(
+            "*, learner:users!learner_id(full_name, email)"
+        ).eq("tutor_id", tutor_id).order("scheduled_time").execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
