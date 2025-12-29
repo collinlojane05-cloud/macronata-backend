@@ -9,42 +9,35 @@ from typing import Optional, List
 
 load_dotenv()
 
-# --- CONFIGURATION ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 if not all([GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
-    # This print helps debug logs in Render
     print("CRITICAL: Missing Environment Variables")
 
-# Configure AI with a Persona
 try:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        "gemini-flash-latest",
-        system_instruction="You are Tinny, an advanced AI tutor for Macronata Academy. You are helpful, patient, and knowledgeable. Keep answers concise."
-    )
-except Exception as e:
-    print(f"AI Config Error: {e}")
+    model = genai.GenerativeModel("gemini-flash-latest", system_instruction="You are Tinny, a helpful AI tutor.")
+except:
+    pass
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI()
 
-# --- SECURITY DEPENDENCY ---
+# --- SECURITY ---
 def verify_token(authorization: Optional[str] = Header(None)):
     if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization Header")
+        raise HTTPException(status_code=401, detail="Missing Token")
     try:
         token = authorization.split(" ")[1] 
         user_response = supabase.auth.get_user(token)
-        if not user_response or not user_response.user:
-            raise HTTPException(status_code=401, detail="Invalid Token")
+        if not user_response.user: raise Exception()
         return user_response.user
-    except Exception:
-        raise HTTPException(status_code=401, detail="Authentication Failed")
+    except:
+        raise HTTPException(status_code=401, detail="Invalid Token")
 
-# --- DATA MODELS ---
+# --- MODELS ---
 class ChatMessage(BaseModel):
     role: str
     parts: List[str]
@@ -56,71 +49,76 @@ class ChatRequest(BaseModel):
 class BookingRequest(BaseModel):
     tutor_id: str
     scheduled_time: str
-    # REMOVED learner_id and cost to match your error fix
+
+class DirectMessageRequest(BaseModel):
+    receiver_id: str
+    content: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
 
 # --- ENDPOINTS ---
-
 @app.get("/")
-def home():
-    return {"message": "Macronata Academy Secure System Online"}
+def home(): return {"status": "Online"}
 
 @app.get("/tutors")
 def get_tutors(user = Depends(verify_token)):
+    return supabase.table("users").select("*").eq("role", "tutor").execute().data
+
+# --- MESSAGING ENDPOINTS (NEW) ---
+
+@app.get("/messages/{other_user_id}")
+def get_chat_history(other_user_id: str, user = Depends(verify_token)):
     try:
-        response = supabase.table("users").select("*").eq("role", "tutor").execute()
+        # Fetch messages where (sender=me AND receiver=them) OR (sender=them AND receiver=me)
+        response = supabase.table("direct_messages").select("*")\
+            .or_(f"and(sender_id.eq.{user.id},receiver_id.eq.{other_user_id}),and(sender_id.eq.{other_user_id},receiver_id.eq.{user.id})")\
+            .order("created_at")\
+            .execute()
         return response.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/messages")
+def send_message(msg: DirectMessageRequest, user = Depends(verify_token)):
+    try:
+        data = {
+            "sender_id": user.id,
+            "receiver_id": msg.receiver_id,
+            "content": msg.content,
+            "media_url": msg.media_url,
+            "media_type": msg.media_type
+        }
+        response = supabase.table("direct_messages").insert(data).execute()
+        return {"status": "sent", "data": response.data[0]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- EXISTING ENDPOINTS ---
 @app.post("/chat")
 def chat_with_tinny(request: ChatRequest, user = Depends(verify_token)):
     try:
-        formatted_history = [{"role": msg.role, "parts": msg.parts} for msg in request.history]
-        chat_session = model.start_chat(history=formatted_history)
-        response = chat_session.send_message(request.message)
-        return {"reply": response.text}
-    except Exception:
-        return {"reply": "I'm having trouble connecting right now. Please try again."}
+        hist = [{"role": m.role, "parts": m.parts} for m in request.history]
+        res = model.start_chat(history=hist).send_message(request.message)
+        return {"reply": res.text}
+    except: return {"reply": "Tinny is offline."}
 
 @app.post("/book_session")
-def book_session(booking: BookingRequest, user = Depends(verify_token)):
+def book_session(b: BookingRequest, user = Depends(verify_token)):
     try:
-        dt_object = datetime.fromisoformat(booking.scheduled_time)
+        dt = datetime.fromisoformat(b.scheduled_time)
+        existing = supabase.table("sessions").select("id").eq("tutor_id", b.tutor_id).eq("scheduled_time", dt.isoformat()).execute()
+        if existing.data: raise HTTPException(409, "Booked")
         
-        # Check for double booking
-        existing = supabase.table("sessions").select("id").eq("tutor_id", booking.tutor_id).eq("scheduled_time", dt_object.isoformat()).execute()
-        if existing.data:
-            raise HTTPException(status_code=409, detail="Slot already booked")
-
-        # Insert using ID from token
-        data = {
-            "tutor_id": booking.tutor_id,
-            "learner_id": user.id,      # SECURE: Comes from token
-            "scheduled_time": dt_object.isoformat(), 
-            "status": "booked",
-            "total_cost_zar": 200.0     # HARDCODED PRICE
-        }
-        
-        response = supabase.table("sessions").insert(data).execute()
-        return {"message": "Session booked successfully!", "data": response.data[0]}
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        print(f"DB ERROR: {e}")
-        raise HTTPException(status_code=500, detail="Database Rejection")
+        data = {"tutor_id": b.tutor_id, "learner_id": user.id, "scheduled_time": dt.isoformat(), "status": "booked", "total_cost_zar": 200.0}
+        supabase.table("sessions").insert(data).execute()
+        return {"msg": "Success"}
+    except HTTPException as h: raise h
+    except Exception as e: raise HTTPException(500, str(e))
 
 @app.get("/my_bookings")
 def get_my_bookings(user = Depends(verify_token)):
-    try:
-        response = supabase.table("sessions").select("*, tutor:users!tutor_id(full_name)").eq("learner_id", user.id).order("scheduled_time").execute()
-        return response.data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return supabase.table("sessions").select("*, tutor:users!tutor_id(full_name)").eq("learner_id", user.id).order("scheduled_time").execute().data
 
 @app.get("/tutor_bookings")
 def get_tutor_bookings(user = Depends(verify_token)):
-    try:
-        response = supabase.table("sessions").select("*, learner:users!learner_id(full_name, email)").eq("tutor_id", user.id).order("scheduled_time").execute()
-        return response.data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return supabase.table("sessions").select("*, learner:users!learner_id(full_name, email)").eq("tutor_id", user.id).order("scheduled_time").execute().data
