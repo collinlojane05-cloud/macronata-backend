@@ -9,28 +9,36 @@ from typing import Optional, List
 
 load_dotenv()
 
+# --- CONFIGURATION ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+# PRIORITY: Try to use the Service Key (Master Key) for the backend. 
+# If not found, fall back to the normal Key (but this causes the RLS error you are seeing).
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")
 
 if not all([GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
-    print("CRITICAL: Missing Environment Variables")
+    print("CRITICAL: Missing Keys. Ensure SUPABASE_SERVICE_KEY is set in Render.")
 
+# Configure AI
 try:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-flash-latest", system_instruction="You are Tinny, a helpful AI tutor.")
-except:
-    pass
+except: pass
 
+# Initialize Client with the Master Key (Bypasses RLS)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 app = FastAPI()
 
 # --- SECURITY ---
 def verify_token(authorization: Optional[str] = Header(None)):
+    """Verifies the user's token but doesn't create a session for the backend client."""
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Token")
     try:
-        token = authorization.split(" ")[1] 
+        token = authorization.split(" ")[1]
+        # We use a purely REST check here to validate the user
         user_response = supabase.auth.get_user(token)
         if not user_response.user: raise Exception()
         return user_response.user
@@ -57,19 +65,20 @@ class DirectMessageRequest(BaseModel):
     media_type: Optional[str] = None
 
 # --- ENDPOINTS ---
+
 @app.get("/")
-def home(): return {"status": "Online"}
+def home(): return {"status": "Macronata Backend Online"}
 
 @app.get("/tutors")
 def get_tutors(user = Depends(verify_token)):
     return supabase.table("users").select("*").eq("role", "tutor").execute().data
 
-# --- MESSAGING ENDPOINTS (NEW) ---
+# --- MESSAGING ---
 
 @app.get("/messages/{other_user_id}")
 def get_chat_history(other_user_id: str, user = Depends(verify_token)):
     try:
-        # Fetch messages where (sender=me AND receiver=them) OR (sender=them AND receiver=me)
+        # Fetch conversation between me and them
         response = supabase.table("direct_messages").select("*")\
             .or_(f"and(sender_id.eq.{user.id},receiver_id.eq.{other_user_id}),and(sender_id.eq.{other_user_id},receiver_id.eq.{user.id})")\
             .order("created_at")\
@@ -81,8 +90,10 @@ def get_chat_history(other_user_id: str, user = Depends(verify_token)):
 @app.post("/messages")
 def send_message(msg: DirectMessageRequest, user = Depends(verify_token)):
     try:
+        # Since 'supabase' client uses the Service Key, it ignores RLS.
+        # We manually ensure the 'sender_id' is correct (the logged-in user).
         data = {
-            "sender_id": user.id,
+            "sender_id": user.id, 
             "receiver_id": msg.receiver_id,
             "content": msg.content,
             "media_url": msg.media_url,
@@ -91,7 +102,8 @@ def send_message(msg: DirectMessageRequest, user = Depends(verify_token)):
         response = supabase.table("direct_messages").insert(data).execute()
         return {"status": "sent", "data": response.data[0]}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"MESSAGE FAILED: {e}") # Check Render logs if this happens
+        raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
 
 # --- EXISTING ENDPOINTS ---
 @app.post("/chat")
