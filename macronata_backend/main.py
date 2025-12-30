@@ -97,7 +97,7 @@ def send_message(msg: DirectMessageRequest, user = Depends(verify_token)):
         return {"status": "sent", "data": supabase.table("direct_messages").insert(data).execute().data[0]}
     except Exception as e: raise HTTPException(500, str(e))
 
-# --- FEATURE 2: YOCO PAYMENTS (FIXED URL) ---
+# --- FEATURE 2: YOCO PAYMENTS (FIXED SUCCESS CHECK) ---
 @app.post("/create_payment")
 def create_payment(booking: BookingRequest, user = Depends(verify_token)):
     """
@@ -107,7 +107,6 @@ def create_payment(booking: BookingRequest, user = Depends(verify_token)):
         return {"payment_url": None, "simulation": True, "message": "Yoco Key Missing - Simulating Payment"}
     
     try:
-        # UPDATED: Correct URL for Yoco Payments
         yoco_url = "https://payments.yoco.com/api/checkouts"
         
         headers = {
@@ -129,10 +128,10 @@ def create_payment(booking: BookingRequest, user = Depends(verify_token)):
         
         res = requests.post(yoco_url, json=payload, headers=headers)
         
-        if res.status_code == 201:
+        # FIX: Accept both 200 and 201 as success
+        if res.status_code in [200, 201]:
             return {"payment_url": res.json()['redirectUrl'], "simulation": False}
         else:
-            # Pass the raw Yoco error back to frontend for debugging
             raise HTTPException(400, f"Yoco Error: {res.text}")
             
     except Exception as e:
