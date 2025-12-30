@@ -9,36 +9,41 @@ from typing import Optional, List
 
 load_dotenv()
 
-# --- CONFIGURATION ---
+# --- DIAGNOSTICS & SETUP ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 
-# PRIORITY: Try to use the Service Key (Master Key) for the backend. 
-# If not found, fall back to the normal Key (but this causes the RLS error you are seeing).
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")
+# CRITICAL: specific check for the Service Key
+SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+
+if not SERVICE_KEY:
+    print("⚠️ WARNING: SUPABASE_SERVICE_KEY is missing! Messaging will fail.")
+    # Fallback only to prevent crash on startup, but DB writes will fail RLS
+    SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+else:
+    print("✅ SUCCESS: Found SUPABASE_SERVICE_KEY. Admin mode active.")
+    SUPABASE_KEY = SERVICE_KEY
 
 if not all([GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
-    print("CRITICAL: Missing Keys. Ensure SUPABASE_SERVICE_KEY is set in Render.")
+    print("CRITICAL: One or more API Keys are completely missing.")
 
-# Configure AI
+# AI Configuration
 try:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-flash-latest", system_instruction="You are Tinny, a helpful AI tutor.")
 except: pass
 
-# Initialize Client with the Master Key (Bypasses RLS)
+# Client Initialization
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 app = FastAPI()
 
 # --- SECURITY ---
 def verify_token(authorization: Optional[str] = Header(None)):
-    """Verifies the user's token but doesn't create a session for the backend client."""
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Token")
     try:
         token = authorization.split(" ")[1]
-        # We use a purely REST check here to validate the user
+        # We use the token ONLY to check who the user is
         user_response = supabase.auth.get_user(token)
         if not user_response.user: raise Exception()
         return user_response.user
@@ -67,7 +72,10 @@ class DirectMessageRequest(BaseModel):
 # --- ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "Macronata Backend Online"}
+def home(): 
+    # This endpoint now helps us debug the key status
+    status = "Admin Mode (Secure)" if SERVICE_KEY else "Guest Mode (Restricted)"
+    return {"status": "Online", "mode": status}
 
 @app.get("/tutors")
 def get_tutors(user = Depends(verify_token)):
@@ -78,7 +86,6 @@ def get_tutors(user = Depends(verify_token)):
 @app.get("/messages/{other_user_id}")
 def get_chat_history(other_user_id: str, user = Depends(verify_token)):
     try:
-        # Fetch conversation between me and them
         response = supabase.table("direct_messages").select("*")\
             .or_(f"and(sender_id.eq.{user.id},receiver_id.eq.{other_user_id}),and(sender_id.eq.{other_user_id},receiver_id.eq.{user.id})")\
             .order("created_at")\
@@ -90,8 +97,7 @@ def get_chat_history(other_user_id: str, user = Depends(verify_token)):
 @app.post("/messages")
 def send_message(msg: DirectMessageRequest, user = Depends(verify_token)):
     try:
-        # Since 'supabase' client uses the Service Key, it ignores RLS.
-        # We manually ensure the 'sender_id' is correct (the logged-in user).
+        # DATA PREPARATION
         data = {
             "sender_id": user.id, 
             "receiver_id": msg.receiver_id,
@@ -99,13 +105,18 @@ def send_message(msg: DirectMessageRequest, user = Depends(verify_token)):
             "media_url": msg.media_url,
             "media_type": msg.media_type
         }
+        
+        # DEBUG LOG (Check Render logs if this fails)
+        print(f"Attempting to send message from {user.id} to {msg.receiver_id}")
+        
         response = supabase.table("direct_messages").insert(data).execute()
         return {"status": "sent", "data": response.data[0]}
     except Exception as e:
-        print(f"MESSAGE FAILED: {e}") # Check Render logs if this happens
+        print(f"MESSAGE FAILED: {str(e)}")
+        # If e contains "policy", it means the Service Key is still wrong
         raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
 
-# --- EXISTING ENDPOINTS ---
+# --- TINNY & BOOKINGS ---
 @app.post("/chat")
 def chat_with_tinny(request: ChatRequest, user = Depends(verify_token)):
     try:
