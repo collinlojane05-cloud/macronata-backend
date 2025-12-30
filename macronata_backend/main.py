@@ -15,9 +15,8 @@ load_dotenv()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
-YOCO_SECRET_KEY = os.environ.get("YOCO_SECRET_KEY") # NEW: Get this from Yoco Dashboard
+YOCO_SECRET_KEY = os.environ.get("YOCO_SECRET_KEY") 
 
-# Fallback to normal key if service key missing (but functionality will be limited)
 SUPABASE_KEY = SUPABASE_SERVICE_KEY or os.environ.get("SUPABASE_KEY")
 
 if not all([GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
@@ -54,7 +53,7 @@ class ChatRequest(BaseModel):
 class BookingRequest(BaseModel):
     tutor_id: str
     scheduled_time: str
-    amount_in_cents: int = 20000 # Default R200.00
+    amount_in_cents: int = 20000 
 
 class DirectMessageRequest(BaseModel):
     receiver_id: str
@@ -98,23 +97,28 @@ def send_message(msg: DirectMessageRequest, user = Depends(verify_token)):
         return {"status": "sent", "data": supabase.table("direct_messages").insert(data).execute().data[0]}
     except Exception as e: raise HTTPException(500, str(e))
 
-# --- FEATURE 2: YOCO PAYMENTS ---
+# --- FEATURE 2: YOCO PAYMENTS (FIXED URL) ---
 @app.post("/create_payment")
 def create_payment(booking: BookingRequest, user = Depends(verify_token)):
     """
-    Creates a Yoco Checkout session and returns the URL.
+    Creates a Yoco Checkout session.
     """
     if not YOCO_SECRET_KEY:
-        # Fallback for testing without Yoco Key
         return {"payment_url": None, "simulation": True, "message": "Yoco Key Missing - Simulating Payment"}
     
     try:
-        # Yoco API Call
-        headers = {"Authorization": f"Bearer {YOCO_SECRET_KEY}", "Content-Type": "application/json"}
+        # UPDATED: Correct URL for Yoco Payments
+        yoco_url = "https://payments.yoco.com/api/checkouts"
+        
+        headers = {
+            "Authorization": f"Bearer {YOCO_SECRET_KEY}", 
+            "Content-Type": "application/json"
+        }
+        
         payload = {
             "amount": booking.amount_in_cents,
             "currency": "ZAR",
-            "cancelUrl": "https://macronata-academy.streamlit.app/", # Replace with your URL
+            "cancelUrl": "https://macronata-academy.streamlit.app/", 
             "successUrl": "https://macronata-academy.streamlit.app/",
             "metadata": {
                 "tutor_id": booking.tutor_id,
@@ -122,17 +126,20 @@ def create_payment(booking: BookingRequest, user = Depends(verify_token)):
                 "scheduled_time": booking.scheduled_time
             }
         }
-        res = requests.post("https://online.yoco.com/v1/checkouts", json=payload, headers=headers)
+        
+        res = requests.post(yoco_url, json=payload, headers=headers)
+        
         if res.status_code == 201:
             return {"payment_url": res.json()['redirectUrl'], "simulation": False}
         else:
+            # Pass the raw Yoco error back to frontend for debugging
             raise HTTPException(400, f"Yoco Error: {res.text}")
+            
     except Exception as e:
         raise HTTPException(500, str(e))
 
 @app.post("/book_session")
 def book_session(b: BookingRequest, user = Depends(verify_token)):
-    # Standard booking endpoint (used after payment success)
     try:
         dt = datetime.fromisoformat(b.scheduled_time)
         data = {
@@ -146,25 +153,18 @@ def book_session(b: BookingRequest, user = Depends(verify_token)):
 # --- FEATURE 3: WHATSAPP BOT ---
 @app.post("/whatsapp")
 async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
-    """
-    Receives WhatsApp msg from Twilio -> Asks Tinny -> Returns TwiML response.
-    """
     print(f"WhatsApp from {From}: {Body}")
-    
     try:
-        # 1. Ask Tinny
         chat = model.start_chat()
         response = chat.send_message(Body)
         tinny_reply = response.text
     except:
         tinny_reply = "I'm having trouble thinking right now. Try again later."
 
-    # 2. Format for Twilio (TwiML)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Message>{tinny_reply}</Message>
     </Response>"""
-    
     return PlainTextResponse(content=twiml, media_type="application/xml")
 
 # --- STANDARD AI CHAT ---
