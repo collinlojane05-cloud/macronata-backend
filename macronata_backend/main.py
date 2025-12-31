@@ -117,8 +117,8 @@ def create_payment(booking: BookingRequest, user = Depends(verify_token)):
         payload = {
             "amount": booking.amount_in_cents,
             "currency": "ZAR",
-            "cancelUrl": "https://macronata-academy.streamlit.app/", 
-            "successUrl": "https://macronata-academy.streamlit.app/",
+            "cancelUrl": "http://localhost:8501/", 
+            "successUrl": "http://localhost:8501/",
             "metadata": {
                 "tutor_id": booking.tutor_id,
                 "learner_id": user.id,
