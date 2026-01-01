@@ -11,28 +11,47 @@ import requests
 
 load_dotenv()
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION & DEBUGGING ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 YOCO_SECRET_KEY = os.environ.get("YOCO_SECRET_KEY") 
-
 SUPABASE_KEY = SUPABASE_SERVICE_KEY or os.environ.get("SUPABASE_KEY")
 
-if not all([GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
-    print("CRITICAL: Missing Core Keys.")
+# --- SAFE STARTUP (PREVENTS CRASHES) ---
+supabase: Optional[Client] = None
+startup_error = None
+
+print("--- STARTING MACRONATA BACKEND ---")
+if not SUPABASE_URL:
+    print("❌ CRITICAL: SUPABASE_URL is missing from Environment Variables.")
+    startup_error = "Missing SUPABASE_URL"
+if not SUPABASE_KEY:
+    print("❌ CRITICAL: SUPABASE_KEY is missing from Environment Variables.")
+    startup_error = "Missing SUPABASE_KEY"
+
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Supabase Client Connected Successfully.")
+    except Exception as e:
+        print(f"❌ CRITICAL: Failed to connect to Supabase: {str(e)}")
+        startup_error = f"Supabase Connection Failed: {str(e)}"
 
 # AI Setup
 try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-flash-latest", system_instruction="You are Tinny, a helpful AI tutor for Macronata Academy.")
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-flash-latest", system_instruction="You are Tinny.")
+    else:
+        print("⚠️ WARNING: GEMINI_API_KEY is missing.")
 except: pass
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI()
 
 # --- SECURITY ---
 def verify_token(authorization: Optional[str] = Header(None)):
+    if not supabase: raise HTTPException(500, "Server Error: Database not connected.")
     if not authorization: raise HTTPException(401, "Missing Token")
     try:
         token = authorization.split(" ")[1]
@@ -56,16 +75,15 @@ class DirectMessageRequest(BaseModel):
     media_url: Optional[str] = None
     media_type: Optional[str] = None
 
-# UPDATED MODELS FOR DYNAMIC REDIRECT
 class BookingRequest(BaseModel):
     tutor_id: str
     scheduled_time: str
     amount_in_cents: int = 20000 
-    return_url: str # <--- NEW: Frontend tells us where to return
+    return_url: str 
 
 class DepositRequest(BaseModel):
     amount_in_cents: int
-    return_url: str # <--- NEW
+    return_url: str 
 
 class WithdrawRequest(BaseModel):
     amount_in_cents: int
@@ -74,7 +92,11 @@ class WithdrawRequest(BaseModel):
 # --- ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "Macronata Titan Online"}
+def home():
+    """Debug Endpoint to check health"""
+    if startup_error:
+        return {"status": "Critical Error", "detail": startup_error}
+    return {"status": "Macronata Titan Online", "database": "Connected"}
 
 @app.get("/users")
 def get_all_users(user = Depends(verify_token)):
@@ -89,7 +111,6 @@ def get_tutors(user = Depends(verify_token)):
     except: return []
 
 # --- WALLET SYSTEM ---
-
 @app.get("/my_wallet")
 def get_my_wallet(user = Depends(verify_token)):
     try:
@@ -109,7 +130,6 @@ def create_deposit_link(req: DepositRequest, user = Depends(verify_token)):
     if not YOCO_SECRET_KEY: return {"url": None, "simulation": True}
     try:
         headers = {"Authorization": f"Bearer {YOCO_SECRET_KEY}", "Content-Type": "application/json"}
-        # USE DYNAMIC RETURN URL
         payload = {
             "amount": req.amount_in_cents, "currency": "ZAR",
             "cancelUrl": req.return_url, "successUrl": req.return_url, 
@@ -146,7 +166,6 @@ def book_with_wallet(b: BookingRequest, user = Depends(verify_token)):
         tutor_wallet = supabase.table("wallets").select("balance_cents").eq("user_id", b.tutor_id).single().execute()
         tutor_bal = tutor_wallet.data['balance_cents'] if tutor_wallet.data else 0
         
-        # Transfers
         supabase.table("wallets").update({"balance_cents": learner_new_bal}).eq("user_id", user.id).execute()
         supabase.table("wallet_transactions").insert({
             "wallet_id": user.id, "amount_cents": -cost, "transaction_type": "payment", "description": "Booking Session", "reference_id": b.tutor_id
@@ -183,12 +202,6 @@ def request_withdrawal(req: WithdrawRequest, user = Depends(verify_token)):
     except Exception as e: raise HTTPException(500, str(e))
 
 # --- MESSAGING & AI ---
-
-@app.get("/create_payment") 
-def create_payment_redirect():
-    # Fallback to prevent 404 if browser calls GET instead of POST
-    return {"msg": "Use POST to create payment"}
-
 @app.get("/messages/{other_user_id}")
 def get_chat_history(other_user_id: str, user = Depends(verify_token)):
     try:
