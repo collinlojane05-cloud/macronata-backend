@@ -227,10 +227,57 @@ else:
         else:
             st.warning("Could not load wallet. Backend might be restarting.")
 
-    # 5. MESSAGES
+    # 5. MESSAGES (REAL SYSTEM)
     elif st.session_state.navigation == "Messages":
         st.title("Messages 💬")
-        st.info("Direct messaging system coming in Phase 4.")
+        
+        # 1. Select who to chat with
+        # We fetch all users so you can pick one.
+        all_users = fetch_data("/users")
+        
+        # Filter out yourself
+        others = [u for u in all_users if u['id'] != st.session_state.user.id]
+        
+        if not others:
+            st.info("No other users found yet.")
+        else:
+            # Create a dropdown to select a person
+            user_map = {u['full_name']: u['id'] for u in others}
+            selected_name = st.selectbox("Chat with:", list(user_map.keys()))
+            receiver_id = user_map[selected_name]
+            
+            # 2. Fetch Chat History
+            # We use a unique key for the container to force a refresh when you switch users
+            chat_container = st.container(height=400, border=True)
+            
+            # Load messages
+            msgs = fetch_data(f"/messages/{receiver_id}")
+            
+            with chat_container:
+                if not msgs:
+                    st.write("No messages yet. Say hi! 👋")
+                else:
+                    for m in msgs:
+                        # Align right if I sent it, Left if they sent it
+                        if m['sender_id'] == st.session_state.user.id:
+                            with st.chat_message("user"):
+                                st.write(m['content'])
+                        else:
+                            with st.chat_message("assistant"): # Using 'assistant' icon for others
+                                st.write(m['content'])
+
+            # 3. Send a Message
+            prompt = st.chat_input(f"Message {selected_name}...")
+            if prompt:
+                payload = {"receiver_id": receiver_id, "content": prompt}
+                try:
+                    res = requests.post(f"{API_URL}/messages", json=payload, headers=get_headers())
+                    if res.status_code == 200:
+                        st.rerun() # Refresh to show new message
+                    else:
+                        st.error("Failed to send.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
         
     # 6. TINNY AI
     elif st.session_state.navigation == "Tinny":
