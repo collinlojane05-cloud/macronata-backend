@@ -1,5 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, Form
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File
 from pydantic import BaseModel
 import google.generativeai as genai
 import os
@@ -8,48 +7,42 @@ from supabase import create_client, Client
 from datetime import datetime
 from typing import Optional, List
 import requests
+import re # Needed for ID Validation
 
 load_dotenv()
 
-# --- CONFIGURATION & DEBUGGING ---
+# --- CONFIGURATION ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
-YOCO_SECRET_KEY = os.environ.get("YOCO_SECRET_KEY") 
 SUPABASE_KEY = SUPABASE_SERVICE_KEY or os.environ.get("SUPABASE_KEY")
+YOCO_SECRET_KEY = os.environ.get("YOCO_SECRET_KEY") 
 
-# --- SAFE STARTUP (PREVENTS CRASHES) ---
+# --- SAFE STARTUP ---
 supabase: Optional[Client] = None
 startup_error = None
 
 print("--- STARTING MACRONATA BACKEND ---")
-if not SUPABASE_URL:
-    print("❌ CRITICAL: SUPABASE_URL is missing from Environment Variables.")
-    startup_error = "Missing SUPABASE_URL"
-if not SUPABASE_KEY:
-    print("❌ CRITICAL: SUPABASE_KEY is missing from Environment Variables.")
-    startup_error = "Missing SUPABASE_KEY"
-
-if SUPABASE_URL and SUPABASE_KEY:
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("❌ CRITICAL: SUPABASE KEYS MISSING.")
+    startup_error = "Missing Database Keys"
+else:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✅ Supabase Client Connected Successfully.")
+        print("✅ Database Connected.")
     except Exception as e:
-        print(f"❌ CRITICAL: Failed to connect to Supabase: {str(e)}")
-        startup_error = f"Supabase Connection Failed: {str(e)}"
+        startup_error = f"Database Connection Failed: {str(e)}"
 
 # AI Setup
 try:
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-flash-latest", system_instruction="You are Tinny.")
-    else:
-        print("⚠️ WARNING: GEMINI_API_KEY is missing.")
+        model = genai.GenerativeModel("gemini-flash-latest", system_instruction="You are Tinny, a helpful AI tutor.")
 except: pass
 
 app = FastAPI()
 
-# --- SECURITY ---
+# --- SECURITY & UTILS ---
 def verify_token(authorization: Optional[str] = Header(None)):
     if not supabase: raise HTTPException(500, "Server Error: Database not connected.")
     if not authorization: raise HTTPException(401, "Missing Token")
@@ -59,6 +52,19 @@ def verify_token(authorization: Optional[str] = Header(None)):
         if not user.user: raise Exception()
         return user.user
     except: raise HTTPException(401, "Invalid Token")
+
+def validate_sa_id(id_number):
+    """Luhn Algorithm to validate South African ID"""
+    if not id_number or not re.match(r'^\d{13}$', id_number):
+        return False
+    total = 0
+    for i, digit in enumerate(id_number):
+        n = int(digit)
+        if i % 2 == 1:
+            n *= 2
+            if n > 9: n -= 9
+        total += n
+    return total % 10 == 0
 
 # --- MODELS ---
 class ChatMessage(BaseModel):
@@ -85,32 +91,87 @@ class DepositRequest(BaseModel):
     amount_in_cents: int
     return_url: str 
 
-class WithdrawRequest(BaseModel):
-    amount_in_cents: int
-    bank_details: str
+class VerificationRequest(BaseModel):
+    id_number: str
+    phone_number: str
 
 # --- ENDPOINTS ---
 
 @app.get("/")
 def home():
-    """Debug Endpoint to check health"""
-    if startup_error:
-        return {"status": "Critical Error", "detail": startup_error}
+    if startup_error: return {"status": "Critical Error", "detail": startup_error}
     return {"status": "Macronata Titan Online", "database": "Connected"}
+
+# --- USER & VERIFICATION ---
+@app.get("/my_profile")
+def get_my_profile(user = Depends(verify_token)):
+    try:
+        return supabase.table("users").select("*").eq("id", user.id).single().execute().data
+    except Exception as e: raise HTTPException(500, str(e))
 
 @app.get("/users")
 def get_all_users(user = Depends(verify_token)):
-    try:
-        return supabase.table("users").select("id, full_name, email, role").execute().data
+    # ONLY show verified users to others
+    try: return supabase.table("users").select("id, full_name, role").eq("verification_status", "verified").execute().data
     except: return []
 
 @app.get("/tutors")
 def get_tutors(user = Depends(verify_token)):
-    try:
-        return supabase.table("users").select("*").eq("role", "tutor").execute().data
+    # Only show verified tutors
+    try: return supabase.table("users").select("*").eq("role", "tutor").eq("verification_status", "verified").execute().data
     except: return []
 
-# --- WALLET SYSTEM ---
+@app.post("/submit_verification")
+def submit_verification(req: VerificationRequest, user = Depends(verify_token)):
+    if not validate_sa_id(req.id_number):
+        raise HTTPException(400, "Invalid South African ID Number.")
+    
+    try:
+        supabase.table("users").update({
+            "id_number": req.id_number,
+            "phone_number": req.phone_number,
+            "verification_status": "pending_approval"
+        }).eq("id", user.id).execute()
+        return {"status": "submitted"}
+    except Exception as e: raise HTTPException(500, str(e))
+
+@app.post("/upload_verification_doc")
+def upload_verification_doc(file: UploadFile = File(...), user = Depends(verify_token)):
+    try:
+        # Save to PRIVATE bucket
+        filename = f"{user.id}/{int(datetime.now().timestamp())}_{file.filename}"
+        file_content = file.file.read()
+        supabase.storage.from_("verification-docs").upload(filename, file_content, {"content-type": file.content_type})
+        return {"status": "uploaded", "path": filename}
+    except Exception as e: raise HTTPException(500, f"Upload failed: {str(e)}")
+
+@app.post("/upload") # Public media upload (Chat)
+def upload_public_file(file: UploadFile = File(...), user = Depends(verify_token)):
+    try:
+        filename = f"{user.id}/{int(datetime.now().timestamp())}_{file.filename}"
+        file_content = file.file.read()
+        supabase.storage.from_("chat-media").upload(filename, file_content, {"content-type": file.content_type})
+        public_url = supabase.storage.from_("chat-media").get_public_url(filename)
+        return {"url": public_url}
+    except Exception as e: raise HTTPException(500, f"Upload failed: {str(e)}")
+
+# --- MESSAGING ---
+@app.get("/messages/{other_user_id}")
+def get_chat_history(other_user_id: str, user = Depends(verify_token)):
+    try:
+        return supabase.table("direct_messages").select("*")\
+            .or_(f"and(sender_id.eq.{user.id},receiver_id.eq.{other_user_id}),and(sender_id.eq.{other_user_id},receiver_id.eq.{user.id})")\
+            .order("created_at").execute().data
+    except Exception as e: raise HTTPException(500, str(e))
+
+@app.post("/messages")
+def send_message(msg: DirectMessageRequest, user = Depends(verify_token)):
+    try:
+        data = {"sender_id": user.id, "receiver_id": msg.receiver_id, "content": msg.content, "media_url": msg.media_url, "media_type": msg.media_type}
+        return {"status": "sent", "data": supabase.table("direct_messages").insert(data).execute().data[0]}
+    except Exception as e: raise HTTPException(500, str(e))
+
+# --- WALLET & PAYMENTS ---
 @app.get("/my_wallet")
 def get_my_wallet(user = Depends(verify_token)):
     try:
@@ -187,45 +248,9 @@ def book_with_wallet(b: BookingRequest, user = Depends(verify_token)):
     except HTTPException as he: raise he
     except Exception as e: raise HTTPException(500, str(e))
 
-@app.post("/withdraw")
-def request_withdrawal(req: WithdrawRequest, user = Depends(verify_token)):
-    try:
-        wallet = supabase.table("wallets").select("balance_cents").eq("user_id", user.id).single().execute()
-        if not wallet.data or wallet.data['balance_cents'] < req.amount_in_cents:
-            raise HTTPException(400, "Insufficient funds.")
-        new_bal = wallet.data['balance_cents'] - req.amount_in_cents
-        supabase.table("wallets").update({"balance_cents": new_bal}).eq("user_id", user.id).execute()
-        supabase.table("wallet_transactions").insert({
-            "wallet_id": user.id, "amount_cents": -req.amount_in_cents, "transaction_type": "withdrawal", "description": f"Withdrawal to {req.bank_details}"
-        }).execute()
-        return {"msg": "Withdrawal processed", "new_balance": new_bal}
-    except Exception as e: raise HTTPException(500, str(e))
-
-# --- MESSAGING & AI ---
-@app.get("/messages/{other_user_id}")
-def get_chat_history(other_user_id: str, user = Depends(verify_token)):
-    try:
-        return supabase.table("direct_messages").select("*")\
-            .or_(f"and(sender_id.eq.{user.id},receiver_id.eq.{other_user_id}),and(sender_id.eq.{other_user_id},receiver_id.eq.{user.id})")\
-            .order("created_at").execute().data
-    except Exception as e: raise HTTPException(500, str(e))
-
-@app.post("/messages")
-def send_message(msg: DirectMessageRequest, user = Depends(verify_token)):
-    try:
-        data = {"sender_id": user.id, "receiver_id": msg.receiver_id, "content": msg.content, "media_url": msg.media_url, "media_type": msg.media_type}
-        return {"status": "sent", "data": supabase.table("direct_messages").insert(data).execute().data[0]}
-    except Exception as e: raise HTTPException(500, str(e))
-
-@app.post("/whatsapp")
-async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
-    print(f"WhatsApp from {From}: {Body}")
-    try:
-        res = model.start_chat().send_message(Body)
-        tinny_reply = res.text
-    except: tinny_reply = "I'm having trouble thinking right now."
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?><Response><Message>{tinny_reply}</Message></Response>"""
-    return PlainTextResponse(content=twiml, media_type="application/xml")
+@app.get("/my_bookings")
+def get_my_bookings(user = Depends(verify_token)):
+    return supabase.table("sessions").select("*, tutor:users!tutor_id(full_name)").eq("learner_id", user.id).execute().data
 
 @app.post("/chat")
 def chat_with_tinny(request: ChatRequest, user = Depends(verify_token)):
@@ -234,7 +259,3 @@ def chat_with_tinny(request: ChatRequest, user = Depends(verify_token)):
         res = model.start_chat(history=hist).send_message(request.message)
         return {"reply": res.text}
     except: return {"reply": "Tinny is offline."}
-
-@app.get("/my_bookings")
-def get_my_bookings(user = Depends(verify_token)):
-    return supabase.table("sessions").select("*, tutor:users!tutor_id(full_name)").eq("learner_id", user.id).execute().data
