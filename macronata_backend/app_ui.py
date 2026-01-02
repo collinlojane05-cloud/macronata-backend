@@ -1,254 +1,265 @@
 import streamlit as st
 import requests
-from supabase import create_client, Client
 import os
-from dotenv import load_dotenv
-import time
+from supabase import create_client
 
-load_dotenv()
-
-# --- CONFIGURATION SWITCH ---
-# CHANGE THIS TO 'False' BEFORE PUSHING TO GITHUB FOR RENDER!
-IS_LOCAL = True 
+# --- 1. CONFIGURATION & PRODUCTION SWITCH ---
+# Set this to False so the app talks to the Internet, not your laptop
+IS_LOCAL = False 
 
 if IS_LOCAL:
-    # 1. Dev Mode (Localhost)
-    APP_BASE_URL = "http://localhost:8501" 
-    API_URL = "https://macronata-backend.onrender.com" # You can use Live backend even when local
+    # Local Testing (VS Code)
+    API_URL = "http://127.0.0.1:8000"
+    APP_URL = "http://localhost:8501"
 else:
-    # 2. Production Mode (Render)
-    # REPLACE THIS with your actual Render Frontend URL after you deploy Step 2
-    APP_BASE_URL = "https://macronata-frontend.onrender.com" 
+    # Live Production (Render)
+    # IMPORTANT: Ensure this matches your exact Backend URL from Render
     API_URL = "https://macronata-backend.onrender.com"
+    APP_URL = "https://macronata-frontend.onrender.com"
 
-# --- SUPABASE SETUP ---
-raw_url = os.environ.get("SUPABASE_URL")
-key = os.environ.get("SUPABASE_KEY")
+# --- 2. SUPABASE CONNECTION (FOR AUTH ONLY) ---
+# The Frontend needs this to log users in.
+# Ensure SUPABASE_URL and SUPABASE_KEY are set in Render -> Frontend -> Environment
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-if not raw_url or not key:
-    st.error("❌ API Keys missing! Check your .env file or Render Env Vars.")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("⚠️ Critical Error: Supabase Keys are missing in Render Environment Variables.")
     st.stop()
 
-supabase_url = raw_url.rstrip("/")
-try:
-    supabase: Client = create_client(supabase_url, key)
-except Exception as e:
-    st.error(f"Init Error: {e}")
-    st.stop()
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-st.set_page_config(page_title="Macronata Academy", page_icon="🇿🇦", layout="wide")
+# --- 3. SESSION STATE SETUP ---
+if "user" not in st.session_state:
+    st.session_state.user = None
+if "auth_token" not in st.session_state:
+    st.session_state.auth_token = None
+if "navigation" not in st.session_state:
+    st.session_state.navigation = "Home"
 
-# --- STATE ---
-if "user" not in st.session_state: st.session_state.user = None
-if "role" not in st.session_state: st.session_state.role = None 
-if "session_token" not in st.session_state: st.session_state.session_token = None
-if "uploader_key" not in st.session_state: st.session_state.uploader_key = 0 
-if "messages" not in st.session_state: st.session_state.messages = []
-
-# --- HELPERS ---
-def get_auth_headers():
-    return {"Authorization": f"Bearer {st.session_state.session_token}"} if st.session_state.session_token else {}
-
-def upload_file_secure(file_obj, is_audio=False):
+# --- 4. AUTHENTICATION FUNCTIONS ---
+def login(email, password):
     try:
-        ext = "wav" if is_audio else file_obj.name.split('.')[-1]
-        file_name = f"{st.session_state.user.id}_{int(time.time())}.{ext}"
-        mime_type = "audio/wav" if is_audio else file_obj.type
-        headers = {"Authorization": f"Bearer {st.session_state.session_token}", "apikey": key, "Content-Type": mime_type}
-        upload_endpoint = f"{supabase_url}/storage/v1/object/chat_assets/{file_name}"
-        data = file_obj.getvalue() if hasattr(file_obj, 'getvalue') else file_obj
-        res = requests.post(upload_endpoint, data=data, headers=headers)
-        return (f"{supabase_url}/storage/v1/object/public/chat_assets/{file_name}", mime_type) if res.status_code == 200 else (None, None)
-    except: return None, None
+        res = supabase.auth.sign_in_with_password({"email": email, "password": password})
+        if res.user:
+            st.session_state.user = res.user
+            st.session_state.auth_token = res.session.access_token
+            st.success("Login Successful!")
+            st.rerun()
+    except Exception as e:
+        st.error(f"Login Failed: {e}")
 
-# --- AUTH ---
-def show_login_page():
-    st.markdown("<h1 style='text-align: center;'>🇿🇦 Macronata Academy</h1>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1,2,1])
-    with col2:
-        tab1, tab2 = st.tabs(["Login", "Sign Up"])
-        with tab1:
-            email = st.text_input("Email", key="l_e")
-            password = st.text_input("Password", type="password", key="l_p")
-            if st.button("Log In", use_container_width=True):
-                try:
-                    res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-                    st.session_state.user = res.user
-                    st.session_state.session_token = res.session.access_token
-                    try:
-                        role_res = supabase.table("users").select("role").eq("id", res.user.id).single().execute()
-                        st.session_state.role = role_res.data['role']
-                    except: st.session_state.role = "learner"
-                    st.rerun()
-                except Exception as e: st.error(f"Login failed: {e}")
+def signup(email, password, full_name, role):
+    try:
+        res = supabase.auth.sign_up({"email": email, "password": password, "options": {"data": {"full_name": full_name, "role": role}}})
+        if res.user:
+            # Add to our public 'users' table via the Backend API to keep data in sync
+            st.success("Account created! Please Log In.")
+    except Exception as e:
+        st.error(f"Signup Failed: {e}")
 
-        with tab2:
-            st.subheader("Join the Marketplace")
-            new_name = st.text_input("Full Name", key="s_n")
-            new_email = st.text_input("Email", key="s_e")
-            new_pass = st.text_input("Password", type="password", key="s_p")
-            new_role = st.selectbox("I am a:", ["learner", "tutor"], key="s_r")
-            if st.button("Sign Up", use_container_width=True):
-                if new_name:
-                    try:
-                        res = supabase.auth.sign_up({"email": new_email, "password": new_pass})
-                        if res.user:
-                            supabase.table("users").insert({"id": res.user.id, "full_name": new_name, "email": new_email, "role": new_role}).execute()
-                            st.success(f"Welcome {new_name}! Please log in.")
-                    except Exception as e: st.error(f"Error: {e}")
-                else: st.error("Name required.")
+def logout():
+    supabase.auth.sign_out()
+    st.session_state.user = None
+    st.session_state.auth_token = None
+    st.rerun()
 
-# --- MAIN APP ---
-if st.session_state.user is None:
-    show_login_page()
+# --- 5. DATA FETCHING (TALKING TO THE BRAIN) ---
+def get_headers():
+    return {"Authorization": f"Bearer {st.session_state.auth_token}"}
+
+def fetch_data(endpoint):
+    """Safe data fetching that doesn't crash the app if backend is waking up"""
+    try:
+        res = requests.get(f"{API_URL}{endpoint}", headers=get_headers())
+        if res.status_code == 200:
+            return res.json()
+        return []
+    except:
+        st.warning("Connecting to Macronata Backend... (If this persists, the server might be restarting)")
+        return []
+
+# --- 6. MAIN APP INTERFACE ---
+st.set_page_config(page_title="Macronata Academy", page_icon="🎓")
+
+# --- SIDEBAR ---
+with st.sidebar:
+    st.title("Macronata 🇿🇦")
+    if st.session_state.user:
+        st.write(f"Hello, {st.session_state.user.user_metadata.get('full_name', 'User')}")
+        st.divider()
+        if st.button("🏠 Home"): st.session_state.navigation = "Home"
+        if st.button("🔍 Find Tutor"): st.session_state.navigation = "Tutors"
+        if st.button("💳 Wallet"): st.session_state.navigation = "Wallet"
+        if st.button("💬 Messages"): st.session_state.navigation = "Messages"
+        if st.button("🤖 Ask Tinny (AI)"): st.session_state.navigation = "Tinny"
+        st.divider()
+        if st.button("Log Out"): logout()
+    else:
+        st.write("Please Log In to access the academy.")
+
+# --- MAIN PAGES ---
+
+if not st.session_state.user:
+    # --- LOGIN / SIGNUP PAGE ---
+    tab1, tab2 = st.tabs(["Log In", "Sign Up"])
+    with tab1:
+        e = st.text_input("Email")
+        p = st.text_input("Password", type="password")
+        if st.button("Log In"): login(e, p)
+    with tab2:
+        ne = st.text_input("New Email")
+        np = st.text_input("New Password", type="password")
+        nf = st.text_input("Full Name")
+        nr = st.selectbox("I am a:", ["learner", "tutor"])
+        if st.button("Sign Up"): signup(ne, np, nf, nr)
+
 else:
-    st.sidebar.title("Macronata 🇿🇦")
-    st.sidebar.write(f"**{st.session_state.user.user_metadata.get('full_name', 'User')}**")
-    menu = ["Messages", "Wallet", "Tinny (AI)", "Profile"]
-    if st.session_state.role == "learner": menu.insert(1, "Find Tutor")
-    page = st.sidebar.radio("Navigate", menu)
+    # --- LOGGED IN PAGES ---
     
-    if st.sidebar.button("Log Out"):
-        st.session_state.user = None
-        st.session_state.session_token = None
-        st.session_state.messages = [] 
-        st.rerun()
+    # 1. HOME
+    if st.session_state.navigation == "Home":
+        st.title("Welcome to Macronata Academy 🎓")
+        st.write("Your gateway to personalized learning and AI tutoring.")
+        
+        # Show upcoming sessions
+        st.subheader("📅 Your Upcoming Bookings")
+        bookings = fetch_data("/my_bookings")
+        if bookings:
+            for b in bookings:
+                with st.expander(f"Session on {b['scheduled_time'][:10]}"):
+                    st.write(f"**Status:** {b['status']}")
+                    st.write(f"**Cost:** R{b.get('total_cost_zar', '0.00')}")
+        else:
+            st.info("No bookings yet. Go to 'Find Tutor' to start!")
 
-    if page == "Wallet":
-        st.title("💰 Digital Wallet")
-        try:
-            res = requests.get(f"{API_URL}/my_wallet", headers=get_auth_headers())
-            if res.status_code == 200:
-                data = res.json()
-                balance_zar = data['balance'] / 100
-                st.metric(label="Current Balance", value=f"R {balance_zar:,.2f}")
-                st.divider()
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.subheader("Top Up Wallet")
-                    amount = st.number_input("Amount (ZAR)", min_value=10, value=200, step=10)
-                    if st.button("Add Funds"):
-                        with st.spinner("Creating Payment Link..."):
-                            # PASS DYNAMIC URL
-                            payload = {"amount_in_cents": int(amount * 100), "return_url": APP_BASE_URL}
-                            pay_res = requests.post(f"{API_URL}/create_deposit", json=payload, headers=get_auth_headers())
-                            if pay_res.status_code == 200:
-                                p_data = pay_res.json()
-                                if p_data.get('url'):
-                                    st.link_button("👉 Pay on Yoco", p_data['url'])
-                                    if st.button("✅ Simulate Success (Testing)"):
-                                        requests.post(f"{API_URL}/confirm_deposit_simulated", json=payload, headers=get_auth_headers())
-                                        st.success("Funds added!")
-                                        time.sleep(1)
-                                        st.rerun()
-                with c2:
-                    if st.session_state.role == "tutor":
-                        st.subheader("Withdraw Funds")
-                        w_amount = st.number_input("Withdraw Amount (ZAR)", min_value=50, max_value=int(balance_zar) if balance_zar > 0 else 0, step=50)
-                        bank = st.text_input("Bank Details")
-                        if st.button("Request Payout"):
-                            if w_amount > balance_zar: st.error("Insufficient funds.")
-                            else:
-                                w_res = requests.post(f"{API_URL}/withdraw", json={"amount_in_cents": int(w_amount*100), "bank_details": bank}, headers=get_auth_headers())
-                                if w_res.status_code == 200:
-                                    st.success("Processed!")
-                                    time.sleep(1)
-                                    st.rerun()
-
-                st.divider()
-                st.subheader("Transaction History")
-                for txn in data['history']:
-                    color = "green" if txn['amount_cents'] > 0 else "red"
-                    amount_fmt = f"R {abs(txn['amount_cents']/100):.2f}"
-                    symbol = "+" if txn['amount_cents'] > 0 else "-"
-                    st.markdown(f"**{txn['description']}** : <span style='color:{color}'>{symbol} {amount_fmt}</span>", unsafe_allow_html=True)
-                    st.write("---")
-        except: st.error("Connection Error.")
-
-    elif page == "Find Tutor":
-        st.title("📚 Book a Tutor")
-        try:
-            tutors = requests.get(f"{API_URL}/tutors", headers=get_auth_headers()).json()
-            if not tutors: st.info("No tutors found.")
+    # 2. FIND TUTOR
+    elif st.session_state.navigation == "Tutors":
+        st.title("Find a Tutor 👩‍🏫")
+        tutors = fetch_data("/tutors")
+        
+        if tutors:
             for t in tutors:
                 with st.container(border=True):
                     c1, c2 = st.columns([3, 1])
                     with c1:
-                        st.subheader(t.get('full_name'))
-                        st.write(f"**Email:** {t.get('email')}")
+                        st.subheader(t['full_name'])
+                        st.write("✨ Verified Tutor")
                     with c2:
-                        st.write("**Rate:** R200.00 / session")
-                        if st.button(f"Select Tutor", key=t['id']):
-                            st.session_state['selected_tutor'] = t
+                        if st.button(f"Book {t['full_name'].split()[0]}", key=t['id']):
+                            # Store tutor ID in session state for booking flow
+                            st.session_state.selected_tutor = t['id']
+                            st.session_state.navigation = "Book"
                             st.rerun()
-            if 'selected_tutor' in st.session_state:
-                t = st.session_state['selected_tutor']
-                st.divider()
-                st.info(f"Booking: {t.get('full_name')}")
-                d = st.date_input("Date")
-                tm = st.time_input("Time")
-                if st.button("Confirm Booking (Pay R200)"):
-                    payload = {"tutor_id": t['id'], "scheduled_time": f"{d}T{tm}", "amount_in_cents": 20000, "return_url": APP_BASE_URL}
-                    with st.spinner("Processing..."):
-                        res = requests.post(f"{API_URL}/book_with_wallet", json=payload, headers=get_auth_headers())
-                        if res.status_code == 200:
-                            st.balloons()
-                            st.success(f"✅ Booking Confirmed!")
-                            time.sleep(3)
-                            del st.session_state['selected_tutor']
-                            st.rerun()
-                        elif res.status_code == 402: st.error("❌ Insufficient Funds! Please Top Up.")
-                        else: st.error(f"Booking Failed: {res.text}")
-        except: st.error("Error.")
+        else:
+            st.warning("No tutors found or Backend is syncing.")
 
-    elif page == "Messages":
-        st.title("💬 Chat")
-        try:
-            users = requests.get(f"{API_URL}/users", headers=get_auth_headers()).json()
-            user_map = {f"{u.get('full_name')} ({u.get('role')})": u['id'] for u in users if u['id'] != st.session_state.user.id}
-            receiver_name = st.selectbox("Chat with:", list(user_map.keys())) if user_map else None
-            if receiver_name:
-                receiver_id = user_map[receiver_name]
-                if st.button("Refresh"): st.rerun()
-                msgs = requests.get(f"{API_URL}/messages/{receiver_id}", headers=get_auth_headers()).json()
-                with st.container(height=450):
-                    for m in msgs:
-                        is_me = m['sender_id'] == st.session_state.user.id
-                        with st.chat_message("user" if is_me else "assistant"):
-                            if m.get('content'): st.write(m['content'])
-                            if m.get('media_url'):
-                                if "audio" in m.get('media_type', ''): st.audio(m['media_url'])
-                                else: st.image(m['media_url'])
-                c1, c2, c3 = st.columns([1, 1, 4])
-                with c1: voice = st.audio_input("Mic", key=f"v_{st.session_state.uploader_key}")
-                with c2: file = st.file_uploader("File", key=f"f_{st.session_state.uploader_key}", label_visibility="collapsed")
-                with c3: txt = st.chat_input("Message...")
-                if txt or file or voice:
-                    url, mtype = None, None
-                    if voice: url, mtype = upload_file_secure(voice, is_audio=True)
-                    elif file: url, mtype = upload_file_secure(file)
-                    requests.post(f"{API_URL}/messages", json={"receiver_id": receiver_id, "content": txt, "media_url": url, "media_type": mtype}, headers=get_auth_headers())
-                    st.session_state.uploader_key += 1
-                    time.sleep(0.5)
-                    st.rerun()
-        except: pass
-
-    elif page == "Tinny (AI)":
-        st.title("🤖 Chat with Tinny")
-        for m in st.session_state.messages:
-            with st.chat_message(m["role"]): st.markdown(m["content"])
-        if p := st.chat_input():
-            st.session_state.messages.append({"role": "user", "content": p})
-            with st.chat_message("user"): st.markdown(p)
-            hist = [{"role": ("user" if m["role"]=="user" else "model"), "parts": [m["content"]]} for m in st.session_state.messages[:-1]]
+    # 3. BOOKING FLOW (Hidden Page)
+    elif st.session_state.navigation == "Book":
+        st.title("Complete Booking ✅")
+        date = st.date_input("Select Date")
+        time = st.time_input("Select Time")
+        
+        st.info("Session Cost: **R200.00**")
+        
+        if st.button("Confirm & Pay with Wallet"):
+            # Combine date and time
+            dt_str = f"{date} {time}"
+            payload = {
+                "tutor_id": st.session_state.selected_tutor,
+                "scheduled_time": str(dt_str),
+                "amount_in_cents": 20000,
+                "return_url": APP_URL
+            }
             try:
-                r = requests.post(f"{API_URL}/chat", json={"message": p, "history": hist}, headers=get_auth_headers()).json()["reply"]
-                st.markdown(r)
-                st.session_state.messages.append({"role": "assistant", "content": r})
-            except: st.error("Offline.")
-    
-    elif page == "Profile":
-        st.title("👤 Profile")
-        if st.session_state.user:
-            st.write(f"Name: {st.session_state.user.user_metadata.get('full_name')}")
-            st.write(f"Role: {st.session_state.role.upper()}")
+                res = requests.post(f"{API_URL}/book_with_wallet", json=payload, headers=get_headers())
+                if res.status_code == 200:
+                    st.balloons()
+                    st.success("Booking Confirmed! Funds deducted.")
+                else:
+                    st.error(f"Booking Failed: {res.text}")
+            except Exception as e:
+                st.error(f"Connection Error: {e}")
+
+    # 4. WALLET
+    elif st.session_state.navigation == "Wallet":
+        st.title("My Wallet 💳")
+        
+        # Get Wallet Data
+        wallet_data = fetch_data("/my_wallet")
+        
+        if wallet_data:
+            balance = wallet_data.get('balance', 0) / 100  # Convert cents to Rands
+            st.metric("Available Balance", f"R {balance:.2f}")
+            
+            # TOP UP SECTION
+            st.divider()
+            st.subheader("Top Up Funds")
+            amount = st.number_input("Amount (ZAR)", min_value=10, value=100)
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Pay with Yoco (Card)"):
+                    payload = {"amount_in_cents": int(amount * 100), "return_url": APP_URL}
+                    res = requests.post(f"{API_URL}/create_deposit", json=payload, headers=get_headers())
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data['url']:
+                            st.link_button("👉 Proceed to Yoco Payment", data['url'])
+                        else:
+                            st.info("Yoco Keys missing. Use Simulation.")
+            with c2:
+                # Simulation for testing
+                if st.button("✅ Simulate Successful Payment"):
+                    payload = {"amount_in_cents": int(amount * 100), "return_url": APP_URL}
+                    requests.post(f"{API_URL}/confirm_deposit_simulated", json=payload, headers=get_headers())
+                    st.success("Funds added (Simulation)!")
+                    st.rerun()
+
+            # HISTORY
+            st.divider()
+            st.subheader("Transaction History")
+            history = wallet_data.get('history', [])
+            if history:
+                for h in history:
+                    color = "green" if h['amount_cents'] > 0 else "red"
+                    st.markdown(f":{color}[R {h['amount_cents']/100:.2f}] - {h['description']}")
+        else:
+            st.warning("Could not load wallet. Backend might be restarting.")
+
+    # 5. MESSAGES
+    elif st.session_state.navigation == "Messages":
+        st.title("Messages 💬")
+        st.info("Direct messaging system coming in Phase 4.")
+        
+    # 6. TINNY AI
+    elif st.session_state.navigation == "Tinny":
+        st.title("Ask Tinny 🤖")
+        
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
+
+        # Display Chat
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.write(msg["parts"][0])
+        
+        # Input
+        prompt = st.chat_input("Ask me about Math, Science, or English...")
+        if prompt:
+            # User Message
+            st.chat_message("user").write(prompt)
+            st.session_state.chat_history.append({"role": "user", "parts": [prompt]})
+            
+            # AI Response (via Backend)
+            payload = {"message": prompt, "history": st.session_state.chat_history}
+            try:
+                res = requests.post(f"{API_URL}/chat", json=payload, headers=get_headers())
+                if res.status_code == 200:
+                    reply = res.json()['reply']
+                    st.chat_message("model").write(reply)
+                    st.session_state.chat_history.append({"role": "model", "parts": [reply]})
+                else:
+                    st.error("Tinny is sleeping (Backend Error).")
+            except:
+                st.error("Tinny is unreachable.")
