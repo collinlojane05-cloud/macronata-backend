@@ -2,9 +2,10 @@ import streamlit as st
 import requests
 import os
 from supabase import create_client
+import time
 
 # --- 1. CONFIGURATION ---
-IS_LOCAL = False # Set to FALSE for Render
+IS_LOCAL = False # Set to False for Live Render
 
 if IS_LOCAL:
     API_URL = "http://127.0.0.1:8000"
@@ -23,21 +24,40 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- 3. SESSION STATE ---
+# --- 3. SESSION STATE & REDIRECT LOGIC ---
 if "user" not in st.session_state: st.session_state.user = None
 if "auth_token" not in st.session_state: st.session_state.auth_token = None
 if "navigation" not in st.session_state: st.session_state.navigation = "Home"
+
+# NEW: Handle URL Redirects (The Magic Fix) 🪄
+# This checks if Yoco sent us back with a specific page instruction
+if "nav" in st.query_params:
+    target_page = st.query_params["nav"]
+    # Only redirect if we are logged in, otherwise user must log in first
+    if st.session_state.user:
+        st.session_state.navigation = target_page
+        # Clear the param so refreshing doesn't get stuck
+        st.query_params.clear()
 
 # --- 4. HELPERS ---
 def get_headers():
     return {"Authorization": f"Bearer {st.session_state.auth_token}"}
 
 def fetch_data(endpoint):
-    try:
-        res = requests.get(f"{API_URL}{endpoint}", headers=get_headers())
-        if res.status_code == 200: return res.json()
-        return []
-    except: return []
+    """Robust fetch with retry for sleeping backend"""
+    retries = 0
+    max_retries = 3
+    while retries < max_retries:
+        try:
+            res = requests.get(f"{API_URL}{endpoint}", headers=get_headers(), timeout=5)
+            if res.status_code == 200: return res.json()
+            time.sleep(2)
+            retries += 1
+        except:
+            # Backend sleeping? Wait longer
+            time.sleep(5)
+            retries += 1
+    return []
 
 def login(email, password):
     try:
@@ -45,6 +65,11 @@ def login(email, password):
         if res.user:
             st.session_state.user = res.user
             st.session_state.auth_token = res.session.access_token
+            
+            # Check if there was a pending redirect before we logged in
+            if "nav" in st.query_params:
+                st.session_state.navigation = st.query_params["nav"]
+                st.query_params.clear()
             st.rerun()
     except Exception as e: st.error(f"Login Failed: {e}")
 
@@ -105,25 +130,32 @@ else:
     elif st.session_state.navigation == "Tutors":
         st.title("Find a Tutor 👩‍🏫")
         tutors = fetch_data("/tutors")
-        for t in tutors:
-            with st.container(border=True):
-                c1, c2 = st.columns([3, 1])
-                c1.subheader(t['full_name'])
-                if c2.button(f"Book", key=t['id']):
-                    st.session_state.selected_tutor = t['id']
-                    st.session_state.navigation = "Book"
-                    st.rerun()
+        if tutors:
+            for t in tutors:
+                with st.container(border=True):
+                    c1, c2 = st.columns([3, 1])
+                    c1.subheader(t['full_name'])
+                    if c2.button(f"Book", key=t['id']):
+                        st.session_state.selected_tutor = t['id']
+                        st.session_state.navigation = "Book"
+                        st.rerun()
+        else: st.info("Loading tutors...")
 
     elif st.session_state.navigation == "Book":
         st.title("Complete Booking")
         d = st.date_input("Date")
         t = st.time_input("Time")
         if st.button("Confirm & Pay R200"):
-            payload = {"tutor_id": st.session_state.selected_tutor, "scheduled_time": f"{d} {t}", "return_url": APP_URL}
+            # Redirect back to HOME after booking success
+            return_link = f"{APP_URL}?nav=Home" 
+            payload = {"tutor_id": st.session_state.selected_tutor, "scheduled_time": f"{d} {t}", "return_url": return_link}
             res = requests.post(f"{API_URL}/book_with_wallet", json=payload, headers=get_headers())
             if res.status_code == 200:
                 st.balloons()
                 st.success("Booked!")
+                time.sleep(2)
+                st.session_state.navigation = "Home"
+                st.rerun()
             else: st.error(res.text)
 
     elif st.session_state.navigation == "Wallet":
@@ -132,16 +164,22 @@ else:
         if w:
             st.metric("Balance", f"R {w.get('balance',0)/100:.2f}")
             amt = st.number_input("Top Up (ZAR)", value=100)
-            if st.button("Pay with Yoco"):
-                res = requests.post(f"{API_URL}/create_deposit", json={"amount_in_cents": int(amt*100), "return_url": APP_URL}, headers=get_headers())
-                if res.status_code == 200: 
-                    if res.json()['url']: st.link_button("Pay Now", res.json()['url'])
-                    else: st.info("Simulating...")
             
-            if st.button("✅ Simulate Payment"):
-                requests.post(f"{API_URL}/confirm_deposit_simulated", json={"amount_in_cents": int(amt*100), "return_url": APP_URL}, headers=get_headers())
-                st.success("Added!")
-                st.rerun()
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Pay with Yoco"):
+                    # MAGIC LINK: Tells Yoco to send us back to the Wallet Page!
+                    magic_link = f"{APP_URL}?nav=Wallet"
+                    res = requests.post(f"{API_URL}/create_deposit", json={"amount_in_cents": int(amt*100), "return_url": magic_link}, headers=get_headers())
+                    if res.status_code == 200: 
+                        if res.json()['url']: st.link_button("👉 Proceed to Pay", res.json()['url'])
+                        else: st.info("Simulating...")
+            
+            with c2:
+                if st.button("✅ Simulate Payment"):
+                    requests.post(f"{API_URL}/confirm_deposit_simulated", json={"amount_in_cents": int(amt*100), "return_url": APP_URL}, headers=get_headers())
+                    st.success("Added!")
+                    st.rerun()
 
     elif st.session_state.navigation == "Messages":
         st.title("Messages 💬")
@@ -157,8 +195,10 @@ else:
             c1, c2 = st.columns([3, 1])
             c1.caption("🟢 Online")
             if c2.button("📞 Call"):
+                # Standard Jitsi Link - Users just close tab to return
                 link = f"https://meet.jit.si/Macronata-{st.session_state.user.id[:4]}-{rec_id[:4]}"
                 requests.post(f"{API_URL}/messages", json={"receiver_id": rec_id, "content": f"📞 Join call: {link}"}, headers=get_headers())
+                st.success("Call link sent! Check chat.")
                 st.rerun()
 
             # CHAT HISTORY
