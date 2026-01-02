@@ -29,6 +29,7 @@ if "user" not in st.session_state: st.session_state.user = None
 if "auth_token" not in st.session_state: st.session_state.auth_token = None
 if "navigation" not in st.session_state: st.session_state.navigation = "Home"
 
+# Handle Redirects (Yoco/Magic Links)
 if "nav" in st.query_params:
     target_page = st.query_params["nav"]
     if st.session_state.user:
@@ -40,17 +41,17 @@ def get_headers():
     return {"Authorization": f"Bearer {st.session_state.auth_token}"}
 
 def fetch_data(endpoint):
-    """Robust fetch with retry"""
+    """Robust fetch with retry loop"""
     retries = 0
     max_retries = 3
     while retries < max_retries:
         try:
             res = requests.get(f"{API_URL}{endpoint}", headers=get_headers(), timeout=5)
             if res.status_code == 200: return res.json()
-            time.sleep(2)
+            time.sleep(2) # Short wait for 500/loading
             retries += 1
         except:
-            time.sleep(5)
+            time.sleep(5) # Long wait for sleeping backend
             retries += 1
     return []
 
@@ -60,6 +61,7 @@ def login(email, password):
         if res.user:
             st.session_state.user = res.user
             st.session_state.auth_token = res.session.access_token
+            # Resume navigation if redirect pending
             if "nav" in st.query_params:
                 st.session_state.navigation = st.query_params["nav"]
                 st.query_params.clear()
@@ -90,6 +92,7 @@ if not st.session_state.user:
         nr = st.selectbox("I am a:", ["learner", "tutor"])
         if st.button("Sign Up"):
             try:
+                # Auth signup only. Backend 'Self-Healing' handles the profile creation on first login.
                 res = supabase.auth.sign_up({"email": ne, "password": np, "options": {"data": {"full_name": nf, "role": nr}}})
                 st.success("Account created! Please Log In.")
             except Exception as e: st.error(str(e))
@@ -130,11 +133,12 @@ else:
                     st.error("Document required.")
                 else:
                     with st.spinner("Encrypting..."):
-                        # Upload Doc
+                        # 1. Upload Doc
                         files = {"file": (doc.name, doc.getvalue(), doc.type)}
                         r_up = requests.post(f"{API_URL}/upload_verification_doc", files=files, headers=get_headers())
+                        
                         if r_up.status_code == 200:
-                            # Submit Data
+                            # 2. Submit Data
                             payload = {"id_number": id_num, "phone_number": phone}
                             r_sub = requests.post(f"{API_URL}/submit_verification", json=payload, headers=get_headers())
                             if r_sub.status_code == 200:

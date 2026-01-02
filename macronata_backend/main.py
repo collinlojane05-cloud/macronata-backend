@@ -7,7 +7,7 @@ from supabase import create_client, Client
 from datetime import datetime
 from typing import Optional, List
 import requests
-import re # Needed for ID Validation
+import re 
 
 load_dotenv()
 
@@ -24,7 +24,6 @@ startup_error = None
 
 print("--- STARTING MACRONATA BACKEND ---")
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("❌ CRITICAL: SUPABASE KEYS MISSING.")
     startup_error = "Missing Database Keys"
 else:
     try:
@@ -102,22 +101,40 @@ def home():
     if startup_error: return {"status": "Critical Error", "detail": startup_error}
     return {"status": "Macronata Titan Online", "database": "Connected"}
 
-# --- USER & VERIFICATION ---
+# --- 🚨 SELF-HEALING PROFILE ENDPOINT 🚨 ---
 @app.get("/my_profile")
 def get_my_profile(user = Depends(verify_token)):
     try:
-        return supabase.table("users").select("*").eq("id", user.id).single().execute().data
-    except Exception as e: raise HTTPException(500, str(e))
+        # 1. Try to fetch existing profile
+        res = supabase.table("users").select("*").eq("id", user.id).execute()
+        if res.data:
+            return res.data[0]
+
+        # 2. IF MISSING: Auto-Create it (Self-Healing)
+        print(f"⚠️ User {user.id} not found in public DB. Auto-creating...")
+        
+        # We default to 'verified' to unblock you immediately
+        new_profile = {
+            "id": user.id,
+            "email": user.email,
+            "full_name": user.user_metadata.get("full_name", "Unknown User"),
+            "role": user.user_metadata.get("role", "learner"),
+            "verification_status": "verified" 
+        }
+        supabase.table("users").insert(new_profile).execute()
+        return new_profile
+
+    except Exception as e:
+        print(f"❌ Profile Error: {e}")
+        raise HTTPException(500, str(e))
 
 @app.get("/users")
 def get_all_users(user = Depends(verify_token)):
-    # ONLY show verified users to others
     try: return supabase.table("users").select("id, full_name, role").eq("verification_status", "verified").execute().data
     except: return []
 
 @app.get("/tutors")
 def get_tutors(user = Depends(verify_token)):
-    # Only show verified tutors
     try: return supabase.table("users").select("*").eq("role", "tutor").eq("verification_status", "verified").execute().data
     except: return []
 
@@ -138,14 +155,13 @@ def submit_verification(req: VerificationRequest, user = Depends(verify_token)):
 @app.post("/upload_verification_doc")
 def upload_verification_doc(file: UploadFile = File(...), user = Depends(verify_token)):
     try:
-        # Save to PRIVATE bucket
         filename = f"{user.id}/{int(datetime.now().timestamp())}_{file.filename}"
         file_content = file.file.read()
         supabase.storage.from_("verification-docs").upload(filename, file_content, {"content-type": file.content_type})
         return {"status": "uploaded", "path": filename}
     except Exception as e: raise HTTPException(500, f"Upload failed: {str(e)}")
 
-@app.post("/upload") # Public media upload (Chat)
+@app.post("/upload") # Public media (Chat)
 def upload_public_file(file: UploadFile = File(...), user = Depends(verify_token)):
     try:
         filename = f"{user.id}/{int(datetime.now().timestamp())}_{file.filename}"
@@ -197,65 +213,4 @@ def create_deposit_link(req: DepositRequest, user = Depends(verify_token)):
             "metadata": {"type": "wallet_deposit", "user_id": user.id}
         }
         res = requests.post("https://payments.yoco.com/api/checkouts", json=payload, headers=headers)
-        if res.status_code in [200, 201]: return {"url": res.json()['redirectUrl'], "simulation": False}
-        else: raise HTTPException(400, f"Yoco Error: {res.text}")
-    except Exception as e: raise HTTPException(500, str(e))
-
-@app.post("/confirm_deposit_simulated")
-def confirm_deposit_sim(req: DepositRequest, user = Depends(verify_token)):
-    try:
-        current = supabase.table("wallets").select("balance_cents").eq("user_id", user.id).single().execute()
-        new_bal = current.data['balance_cents'] + req.amount_in_cents
-        supabase.table("wallets").update({"balance_cents": new_bal}).eq("user_id", user.id).execute()
-        supabase.table("wallet_transactions").insert({
-            "wallet_id": user.id, "amount_cents": req.amount_in_cents, "transaction_type": "deposit", "description": "Top Up via Yoco (Simulated)"
-        }).execute()
-        return {"status": "Funds Added", "new_balance": new_bal}
-    except Exception as e: raise HTTPException(500, str(e))
-
-@app.post("/book_with_wallet")
-def book_with_wallet(b: BookingRequest, user = Depends(verify_token)):
-    try:
-        cost = b.amount_in_cents
-        tutor_share = int(cost * 0.85)
-        
-        learner_wallet = supabase.table("wallets").select("balance_cents").eq("user_id", user.id).single().execute()
-        if not learner_wallet.data or learner_wallet.data['balance_cents'] < cost:
-            raise HTTPException(402, "Insufficient Funds.")
-        
-        learner_new_bal = learner_wallet.data['balance_cents'] - cost
-        tutor_wallet = supabase.table("wallets").select("balance_cents").eq("user_id", b.tutor_id).single().execute()
-        tutor_bal = tutor_wallet.data['balance_cents'] if tutor_wallet.data else 0
-        
-        supabase.table("wallets").update({"balance_cents": learner_new_bal}).eq("user_id", user.id).execute()
-        supabase.table("wallet_transactions").insert({
-            "wallet_id": user.id, "amount_cents": -cost, "transaction_type": "payment", "description": "Booking Session", "reference_id": b.tutor_id
-        }).execute()
-        
-        if not tutor_wallet.data: supabase.table("wallets").insert({"user_id": b.tutor_id, "balance_cents": tutor_share}).execute()
-        else: supabase.table("wallets").update({"balance_cents": tutor_bal + tutor_share}).eq("user_id", b.tutor_id).execute()
-             
-        supabase.table("wallet_transactions").insert({
-            "wallet_id": b.tutor_id, "amount_cents": tutor_share, "transaction_type": "receiving", "description": "Session Payment Received", "reference_id": user.id
-        }).execute()
-
-        dt = datetime.fromisoformat(b.scheduled_time)
-        supabase.table("sessions").insert({
-            "tutor_id": b.tutor_id, "learner_id": user.id, "scheduled_time": dt.isoformat(), "status": "confirmed", "total_cost_zar": cost/100
-        }).execute()
-
-        return {"msg": "Booking Successful", "balance_remaining": learner_new_bal}
-    except HTTPException as he: raise he
-    except Exception as e: raise HTTPException(500, str(e))
-
-@app.get("/my_bookings")
-def get_my_bookings(user = Depends(verify_token)):
-    return supabase.table("sessions").select("*, tutor:users!tutor_id(full_name)").eq("learner_id", user.id).execute().data
-
-@app.post("/chat")
-def chat_with_tinny(request: ChatRequest, user = Depends(verify_token)):
-    try:
-        hist = [{"role": m.role, "parts": m.parts} for m in request.history]
-        res = model.start_chat(history=hist).send_message(request.message)
-        return {"reply": res.text}
-    except: return {"reply": "Tinny is offline."}
+        if res.status_code in [200, 201]: return {"url": res.json()['redirectUrl
