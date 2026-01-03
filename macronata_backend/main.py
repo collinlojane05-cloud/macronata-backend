@@ -4,14 +4,14 @@ import google.generativeai as genai
 import os
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 import requests
 import re 
 
 load_dotenv()
 
-# --- CONFIGURATION ---
+# --- 1. CONFIGURATION ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -36,12 +36,12 @@ else:
 try:
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-flash-latest", system_instruction="You are Tinny, a helpful AI tutor.")
+        model = genai.GenerativeModel("gemini-flash-latest", system_instruction="You are Tinny, a helpful AI tutor for Macronata Academy.")
 except: pass
 
 app = FastAPI()
 
-# --- SECURITY & UTILS ---
+# --- 2. SECURITY & UTILS ---
 def verify_token(authorization: Optional[str] = Header(None)):
     if not supabase: raise HTTPException(500, "Server Error: Database not connected.")
     if not authorization: raise HTTPException(401, "Missing Token")
@@ -65,7 +65,7 @@ def validate_sa_id(id_number):
         total += n
     return total % 10 == 0
 
-# --- MODELS ---
+# --- 3. DATA MODELS ---
 class ChatMessage(BaseModel):
     role: str
     parts: List[str]
@@ -85,6 +85,8 @@ class BookingRequest(BaseModel):
     scheduled_time: str
     amount_in_cents: int = 20000 
     return_url: str 
+    # New: Optional business ID if booking via an institute
+    business_id: Optional[str] = None
 
 class DepositRequest(BaseModel):
     amount_in_cents: int
@@ -94,14 +96,28 @@ class VerificationRequest(BaseModel):
     id_number: str
     phone_number: str
 
-# --- ENDPOINTS ---
+# NEW: Model for specialized registration
+class RegistrationRequest(BaseModel):
+    email: str
+    password: str
+    full_name: str
+    role: str # 'learner', 'tutor', 'parent', 'business'
+    company_name: Optional[str] = None 
+    child_email: Optional[str] = None
+
+# NEW: Model for Session Control (Escrow)
+class SessionControl(BaseModel):
+    session_id: str
+    action: str # 'start' or 'end'
+
+# --- 4. ENDPOINTS ---
 
 @app.get("/")
 def home():
     if startup_error: return {"status": "Critical Error", "detail": startup_error}
     return {"status": "Macronata Titan Online", "database": "Connected"}
 
-# --- 🚨 SELF-HEALING PROFILE ENDPOINT 🚨 ---
+# --- 👤 SELF-HEALING PROFILE ---
 @app.get("/my_profile")
 def get_my_profile(user = Depends(verify_token)):
     try:
@@ -113,7 +129,7 @@ def get_my_profile(user = Depends(verify_token)):
         # 2. IF MISSING: Auto-Create it (Self-Healing)
         print(f"⚠️ User {user.id} not found in public DB. Auto-creating...")
         
-        # We default to 'verified' to unblock you immediately
+        # Default to 'verified' to unblock you during dev
         new_profile = {
             "id": user.id,
             "email": user.email,
@@ -128,6 +144,47 @@ def get_my_profile(user = Depends(verify_token)):
         print(f"❌ Profile Error: {e}")
         raise HTTPException(500, str(e))
 
+# --- 📝 REGISTRATION (SPECIALIZED) ---
+@app.post("/register_specialized")
+def register_user(req: RegistrationRequest):
+    try:
+        # 1. Create Auth User in Supabase
+        auth_res = supabase.auth.sign_up({
+            "email": req.email, 
+            "password": req.password,
+            "options": {"data": {"full_name": req.full_name, "role": req.role}}
+        })
+        
+        if not auth_res.user:
+            raise HTTPException(400, "Registration failed or email requires confirmation.")
+            
+        user_id = auth_res.user.id
+        
+        # 2. Handle Specialized Roles (Insert into specific tables)
+        if req.role == 'business':
+            # Check if businesses table exists first
+            try:
+                supabase.table("businesses").insert({
+                    "id": user_id,
+                    "company_name": req.company_name or req.full_name,
+                    "is_verified": False
+                }).execute()
+            except: pass # Table might not exist yet if SQL wasn't run
+            
+        elif req.role == 'parent':
+            try:
+                supabase.table("parents").insert({"id": user_id}).execute()
+            except: pass
+
+        # 3. Create Wallet for everyone
+        supabase.table("wallets").insert({"user_id": user_id, "balance_cents": 0}).execute()
+        
+        return {"status": "created", "user_id": user_id, "role": req.role}
+        
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+# --- 🔍 DISCOVERY ---
 @app.get("/users")
 def get_all_users(user = Depends(verify_token)):
     try: return supabase.table("users").select("id, full_name, role").eq("verification_status", "verified").execute().data
@@ -138,6 +195,7 @@ def get_tutors(user = Depends(verify_token)):
     try: return supabase.table("users").select("*").eq("role", "tutor").eq("verification_status", "verified").execute().data
     except: return []
 
+# --- ✅ VERIFICATION ---
 @app.post("/submit_verification")
 def submit_verification(req: VerificationRequest, user = Depends(verify_token)):
     if not validate_sa_id(req.id_number):
@@ -161,17 +219,7 @@ def upload_verification_doc(file: UploadFile = File(...), user = Depends(verify_
         return {"status": "uploaded", "path": filename}
     except Exception as e: raise HTTPException(500, f"Upload failed: {str(e)}")
 
-@app.post("/upload") # Public media (Chat)
-def upload_public_file(file: UploadFile = File(...), user = Depends(verify_token)):
-    try:
-        filename = f"{user.id}/{int(datetime.now().timestamp())}_{file.filename}"
-        file_content = file.file.read()
-        supabase.storage.from_("chat-media").upload(filename, file_content, {"content-type": file.content_type})
-        public_url = supabase.storage.from_("chat-media").get_public_url(filename)
-        return {"url": public_url}
-    except Exception as e: raise HTTPException(500, f"Upload failed: {str(e)}")
-
-# --- MESSAGING ---
+# --- 💬 MESSAGING ---
 @app.get("/messages/{other_user_id}")
 def get_chat_history(other_user_id: str, user = Depends(verify_token)):
     try:
@@ -187,19 +235,32 @@ def send_message(msg: DirectMessageRequest, user = Depends(verify_token)):
         return {"status": "sent", "data": supabase.table("direct_messages").insert(data).execute().data[0]}
     except Exception as e: raise HTTPException(500, str(e))
 
-# --- WALLET & PAYMENTS ---
+@app.post("/upload") # Public media (Chat)
+def upload_public_file(file: UploadFile = File(...), user = Depends(verify_token)):
+    try:
+        filename = f"{user.id}/{int(datetime.now().timestamp())}_{file.filename}"
+        file_content = file.file.read()
+        supabase.storage.from_("chat-media").upload(filename, file_content, {"content-type": file.content_type})
+        public_url = supabase.storage.from_("chat-media").get_public_url(filename)
+        return {"url": public_url}
+    except Exception as e: raise HTTPException(500, f"Upload failed: {str(e)}")
+
+# --- 💳 WALLET & PAYMENTS ---
 @app.get("/my_wallet")
 def get_my_wallet(user = Depends(verify_token)):
     try:
         wallet = supabase.table("wallets").select("*").eq("user_id", user.id).maybe_single().execute()
         if not wallet.data:
+            # Auto-create wallet if missing
             supabase.table("wallets").insert({"user_id": user.id, "balance_cents": 0}).execute()
-            balance = 0
-        else:
-            balance = wallet.data['balance_cents']
-        
+            return {"balance": 0, "locked": 0, "history": []}
+            
         history = supabase.table("wallet_transactions").select("*").eq("wallet_id", user.id).order("created_at", desc=True).execute()
-        return {"balance": balance, "history": history.data}
+        
+        # Include locked balance if column exists, else 0
+        locked = wallet.data.get('locked_balance_cents', 0)
+        
+        return {"balance": wallet.data['balance_cents'], "locked": locked, "history": history.data}
     except Exception as e: raise HTTPException(500, str(e))
 
 @app.post("/create_deposit")
@@ -213,4 +274,173 @@ def create_deposit_link(req: DepositRequest, user = Depends(verify_token)):
             "metadata": {"type": "wallet_deposit", "user_id": user.id}
         }
         res = requests.post("https://payments.yoco.com/api/checkouts", json=payload, headers=headers)
-        if res.status_code in [200, 201]: return {"url": res.json()['redirectUrl
+        if res.status_code in [200, 201]: return {"url": res.json()['redirectUrl'], "simulation": False}
+        else: raise HTTPException(400, f"Yoco Error: {res.text}")
+    except Exception as e: raise HTTPException(500, str(e))
+
+@app.post("/confirm_deposit_simulated")
+def confirm_deposit_sim(req: DepositRequest, user = Depends(verify_token)):
+    try:
+        current = supabase.table("wallets").select("balance_cents").eq("user_id", user.id).single().execute()
+        new_bal = current.data['balance_cents'] + req.amount_in_cents
+        supabase.table("wallets").update({"balance_cents": new_bal}).eq("user_id", user.id).execute()
+        supabase.table("wallet_transactions").insert({
+            "wallet_id": user.id, "amount_cents": req.amount_in_cents, "transaction_type": "deposit", "description": "Top Up via Yoco (Simulated)"
+        }).execute()
+        return {"status": "Funds Added", "new_balance": new_bal}
+    except Exception as e: raise HTTPException(500, str(e))
+
+# --- ⏱️ SESSIONS & ESCROW (NEW LOGIC) ---
+
+@app.post("/book_with_wallet")
+def book_with_wallet(b: BookingRequest, user = Depends(verify_token)):
+    """
+    Creates a 'Scheduled' session. Money is NOT deducted yet.
+    Money is deducted when the session actually STARTS (Escrow Lock).
+    """
+    try:
+        dt = datetime.fromisoformat(b.scheduled_time)
+        
+        # Insert Session
+        data = {
+            "tutor_id": b.tutor_id, 
+            "learner_id": user.id, 
+            "scheduled_time": dt.isoformat(), 
+            "status": "scheduled", 
+            "hourly_rate_cents": b.amount_in_cents, # Assuming input is hourly rate
+            "max_cost_cap_cents": b.amount_in_cents # We cap the session cost at 1 hour for now
+        }
+        
+        if b.business_id:
+            data['business_id'] = b.business_id
+            
+        supabase.table("sessions").insert(data).execute()
+        return {"msg": "Booking Successful", "status": "scheduled"}
+        
+    except Exception as e: raise HTTPException(500, str(e))
+
+@app.post("/session_control")
+def control_session(ctrl: SessionControl, user = Depends(verify_token)):
+    """
+    Handles START (Lock Funds) and END (Calculate & Pay).
+    """
+    try:
+        # Fetch Session
+        session_res = supabase.table("sessions").select("*").eq("id", ctrl.session_id).execute()
+        if not session_res.data: raise HTTPException(404, "Session not found")
+        session = session_res.data[0]
+        
+        if ctrl.action == "start":
+            # 1. LOCK FUNDS
+            learner_id = session['learner_id']
+            cost_cap = session['max_cost_cap_cents']
+            
+            # Check Balance
+            wallet_res = supabase.table("wallets").select("*").eq("user_id", learner_id).single().execute()
+            learner_wallet = wallet_res.data
+            
+            if learner_wallet['balance_cents'] < cost_cap:
+                raise HTTPException(402, "Insufficient funds to start session")
+                
+            # Move funds: Balance -> Locked
+            new_bal = learner_wallet['balance_cents'] - cost_cap
+            new_locked = learner_wallet.get('locked_balance_cents', 0) + cost_cap
+            
+            supabase.table("wallets").update({
+                "balance_cents": new_bal,
+                "locked_balance_cents": new_locked
+            }).eq("user_id", learner_id).execute()
+            
+            # Start Timer
+            supabase.table("sessions").update({
+                "status": "live",
+                "start_time": datetime.now().isoformat()
+            }).eq("id", ctrl.session_id).execute()
+            
+            return {"status": "Session Started", "locked_funds": cost_cap}
+
+        elif ctrl.action == "end":
+            # 2. CALCULATE FINAL COST
+            if not session.get('start_time'):
+                raise HTTPException(400, "Session was never started")
+                
+            start_time = datetime.fromisoformat(session['start_time'].replace('Z', '+00:00'))
+            end_time = datetime.now(start_time.tzinfo) # Ensure timezone match
+            duration_seconds = (end_time - start_time).total_seconds()
+            
+            # Calculate cost (Rate per hour / 3600 * seconds)
+            rate_per_sec = session['hourly_rate_cents'] / 3600.0
+            final_cost = int(duration_seconds * rate_per_sec)
+            
+            # Safety Cap
+            locked_amt = session['max_cost_cap_cents']
+            if final_cost > locked_amt: final_cost = locked_amt
+            if final_cost < 0: final_cost = 0 # Safety
+            
+            refund_amt = locked_amt - final_cost
+            
+            # 3. DISTRIBUTE FUNDS
+            # A. Refund Learner (Unlock unused funds)
+            learner_id = session['learner_id']
+            l_wallet = supabase.table("wallets").select("*").eq("user_id", learner_id).single().execute().data
+            
+            supabase.table("wallets").update({
+                "locked_balance_cents": l_wallet.get('locked_balance_cents', locked_amt) - locked_amt,
+                "balance_cents": l_wallet['balance_cents'] + refund_amt
+            }).eq("user_id", learner_id).execute()
+            
+            # B. Pay Tutor (With Commission)
+            commission_rate = 0.15
+            # Check Business Exception (0% comm)
+            if session.get('business_id'):
+                # Fetch business details to check comm rate if needed
+                commission_rate = 0.0
+            
+            platform_fee = int(final_cost * commission_rate)
+            tutor_pay = final_cost - platform_fee
+            
+            pay_recipient_id = session.get('business_id') or session['tutor_id']
+            
+            t_wallet = supabase.table("wallets").select("*").eq("user_id", pay_recipient_id).single().execute().data
+            if not t_wallet:
+                 # Create wallet if missing
+                 supabase.table("wallets").insert({"user_id": pay_recipient_id, "balance_cents": 0}).execute()
+                 t_bal = 0
+            else:
+                 t_bal = t_wallet['balance_cents']
+            
+            supabase.table("wallets").update({
+                "balance_cents": t_bal + tutor_pay
+            }).eq("user_id", pay_recipient_id).execute()
+
+            # C. Close Session
+            supabase.table("sessions").update({
+                "status": "completed",
+                "end_time": end_time.isoformat(),
+                "final_cost_cents": final_cost
+            }).eq("id", ctrl.session_id).execute()
+            
+            # D. Record Transaction Log (Simplified)
+            supabase.table("wallet_transactions").insert([
+                {"wallet_id": learner_id, "amount_cents": -final_cost, "transaction_type": "payment", "description": "Session Cost"},
+                {"wallet_id": pay_recipient_id, "amount_cents": tutor_pay, "transaction_type": "earning", "description": "Session Earnings"}
+            ]).execute()
+
+            return {"status": "Session Ended", "duration_sec": duration_seconds, "final_cost": final_cost}
+
+    except Exception as e:
+        print(f"Session Error: {e}")
+        raise HTTPException(500, str(e))
+
+@app.get("/my_bookings")
+def get_my_bookings(user = Depends(verify_token)):
+    return supabase.table("sessions").select("*, tutor:users!tutor_id(full_name)").eq("learner_id", user.id).execute().data
+
+# --- 🤖 AI TUTOR ---
+@app.post("/chat")
+def chat_with_tinny(request: ChatRequest, user = Depends(verify_token)):
+    try:
+        hist = [{"role": m.role, "parts": m.parts} for m in request.history]
+        res = model.start_chat(history=hist).send_message(request.message)
+        return {"reply": res.text}
+    except: return {"reply": "Tinny is offline."}
