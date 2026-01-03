@@ -436,6 +436,75 @@ def control_session(ctrl: SessionControl, user = Depends(verify_token)):
 def get_my_bookings(user = Depends(verify_token)):
     return supabase.table("sessions").select("*, tutor:users!tutor_id(full_name)").eq("learner_id", user.id).execute().data
 
+# --- 👨‍👩‍👧 PARENT FEATURES ---
+
+class LinkChildRequest(BaseModel):
+    child_email: str
+
+@app.post("/link_child")
+def link_child(req: LinkChildRequest, user = Depends(verify_token)):
+    """
+    Allows a Parent to link an existing Learner account to themselves.
+    (In a real app, this would send an invite. For now, it links directly if email exists.)
+    """
+    try:
+        # 1. Verify I am a parent
+        parent_check = supabase.table("parents").select("id").eq("id", user.id).execute()
+        if not parent_check.data:
+            raise HTTPException(403, "Only Parents can link children.")
+
+        # 2. Find the child
+        child_res = supabase.table("users").select("id, role").eq("email", req.child_email).single().execute()
+        if not child_res.data:
+            raise HTTPException(404, "Learner account not found. Please ask them to register first.")
+        
+        child = child_res.data
+        if child['role'] != 'learner':
+            raise HTTPException(400, "You can only link 'Learner' accounts.")
+
+        # 3. Create the Link
+        supabase.table("users").update({
+            "parent_id": user.id
+        }).eq("id", child['id']).execute()
+
+        return {"status": "Child Linked Successfully"}
+
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/my_children")
+def get_my_children(user = Depends(verify_token)):
+    """
+    Fetches all learners linked to this parent, including their session stats.
+    """
+    try:
+        # 1. Get Children Profiles
+        children = supabase.table("users").select("*").eq("parent_id", user.id).execute().data
+        
+        # 2. Enrich with Session Data (Performance) for each child
+        enhanced_data = []
+        for child in children:
+            sessions = supabase.table("sessions").select("*").eq("learner_id", child['id']).eq("status", "completed").execute().data
+            
+            # Simple Analytics
+            total_sessions = len(sessions)
+            total_spend = sum(s['final_cost_cents'] for s in sessions)
+            last_seen = sessions[0]['end_time'] if sessions else "New"
+            
+            enhanced_data.append({
+                "profile": child,
+                "stats": {
+                    "sessions_count": total_sessions,
+                    "total_spend_zar": total_spend / 100,
+                    "last_active": last_seen
+                }
+            })
+            
+        return enhanced_data
+
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
 # --- 🤖 AI TUTOR ---
 @app.post("/chat")
 def chat_with_tinny(request: ChatRequest, user = Depends(verify_token)):
