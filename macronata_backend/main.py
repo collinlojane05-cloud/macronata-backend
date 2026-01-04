@@ -130,26 +130,52 @@ def home():
     if startup_error: return {"status": "Critical Error", "detail": startup_error}
     return {"status": "Macronata Titan Online", "database": "Connected"}
 
-# --- 📝 REGISTRATION ---
+# REPLACE YOUR EXISTING register_user FUNCTION WITH THIS ONE
+
 @app.post("/register_specialized")
 def register_user(req: RegistrationRequest):
     try:
+        # 1. Create the Auth User (The Login Credentials)
         auth_res = supabase.auth.sign_up({
-            "email": req.email, "password": req.password,
-            "options": {"data": {"full_name": req.full_name, "role": req.role}, "email_redirect_to": FRONTEND_URL}
+            "email": req.email, 
+            "password": req.password,
+            "options": {
+                "data": {"full_name": req.full_name, "role": req.role}, 
+                "email_redirect_to": FRONTEND_URL
+            }
         })
+        
         user_id = auth_res.user.id if auth_res.user else None
+        
         if user_id:
+            # 2. 🔥 CRITICAL FIX: Manually Insert into public.users
+            # This ensures the Login page finds the correct role immediately.
+            try:
+                supabase.table("users").insert({
+                    "id": user_id,
+                    "email": req.email,
+                    "full_name": req.full_name,
+                    "role": req.role,
+                    "verification_status": "verified"
+                }).execute()
+            except Exception as e:
+                print(f"User profile creation warning: {e}")
+
+            # 3. Create Role-Specific Entries
             if req.role == 'business':
                 try: supabase.table("businesses").insert({"id": user_id, "company_name": req.company_name or req.full_name, "is_verified": False}).execute()
                 except: pass
             elif req.role == 'parent':
                 try: supabase.table("parents").insert({"id": user_id}).execute()
                 except: pass
+            
+            # 4. Create Wallet
             try: supabase.table("wallets").insert({"user_id": user_id, "balance_cents": 0}).execute()
             except: pass
+
         return {"status": "created", "user_id": user_id, "role": req.role}
-    except Exception as e: raise HTTPException(400, str(e))
+    except Exception as e: 
+        raise HTTPException(400, str(e))
 
 # --- 👤 SELF-HEALING PROFILE ---
 @app.get("/my_profile")
