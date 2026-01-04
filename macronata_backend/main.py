@@ -230,6 +230,89 @@ def get_my_children(user = Depends(verify_token)):
             })
         return enhanced_data
     except Exception as e: raise HTTPException(500, str(e))
+    
+    # --- 🏢 BUSINESS FEATURES ---
+
+@app.get("/my_business_dashboard")
+def get_business_dashboard(user = Depends(verify_token)):
+    """
+    Fetches the Company Profile + List of Linked Learners + Aggregate Stats
+    """
+    try:
+        # 1. Verify this user is a Business
+        biz_check = supabase.table("businesses").select("*").eq("id", user.id).execute()
+        if not biz_check.data:
+            raise HTTPException(403, "Access Denied: Not a Business Account.")
+        
+        business_profile = biz_check.data[0]
+
+        # 2. Fetch Linked Learners
+        learners = supabase.table("users").select("*").eq("business_id", user.id).execute().data
+        
+        # 3. Calculate Stats (e.g., Total Sessions held by my students)
+        total_sessions = 0
+        active_sessions = 0
+        
+        learner_data = []
+        for l in learners:
+            # Get sessions for this specific student
+            # We filter sessions that are LINKED to this business (business_id)
+            sessions = supabase.table("sessions").select("*").eq("learner_id", l['id']).execute().data
+            l_session_count = len(sessions)
+            total_sessions += l_session_count
+            
+            # Check if currently in a live session
+            is_live = any(s['status'] == 'live' for s in sessions)
+            if is_live: active_sessions += 1
+            
+            learner_data.append({
+                "id": l['id'],
+                "full_name": l['full_name'],
+                "email": l['email'],
+                "session_count": l_session_count,
+                "status": "Live Now" if is_live else "Offline"
+            })
+
+        return {
+            "profile": business_profile,
+            "stats": {
+                "total_students": len(learners),
+                "total_sessions": total_sessions,
+                "active_now": active_sessions
+            },
+            "students": learner_data
+        }
+
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+class AddStudentRequest(BaseModel):
+    student_email: str
+
+@app.post("/add_student_to_business")
+def add_student(req: AddStudentRequest, user = Depends(verify_token)):
+    """
+    Link an existing learner to this business.
+    """
+    try:
+        # Verify Business
+        if not supabase.table("businesses").select("id").eq("id", user.id).execute().data:
+            raise HTTPException(403, "Only Businesses can perform this action.")
+            
+        # Find Student
+        student = supabase.table("users").select("id, role").eq("email", req.student_email).single().execute().data
+        if not student: raise HTTPException(404, "Student email not found.")
+        if student['role'] != 'learner': raise HTTPException(400, "User is not a learner.")
+        
+        # Link them
+        supabase.table("users").update({
+            "business_id": user.id
+        }).eq("id", student['id']).execute()
+        
+        return {"status": "Student Added Successfully"}
+        
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 # --- 🔍 DISCOVERY & VERIFICATION ---
 @app.get("/users")
