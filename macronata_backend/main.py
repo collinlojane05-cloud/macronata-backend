@@ -116,10 +116,12 @@ class VerificationRequest(BaseModel):
 class AddStudentRequest(BaseModel):
     student_email: str
 
+# 👇 UPDATED MODEL WITH MEETING LINK
 class TutorProfileUpdate(BaseModel):
     hourly_rate_cents: int
     subjects: List[str]
     bio: str
+    meeting_link: Optional[str] = None 
 
 # --- 4. ENDPOINTS ---
 
@@ -239,10 +241,22 @@ def get_tutor_dashboard(user = Depends(verify_token)):
         return {"profile": profile, "stats": {"total_earnings_zar": total_earnings / 100, "completed_count": len(completed), "upcoming_count": len(upcoming)}, "upcoming_sessions": upcoming}
     except Exception as e: raise HTTPException(500, str(e))
 
+# 👇 UPDATED TUTOR PROFILE ENDPOINT
 @app.post("/update_tutor_profile")
 def update_tutor_profile(req: TutorProfileUpdate, user = Depends(verify_token)):
     try:
-        supabase.table("users").update({"hourly_rate_cents": req.hourly_rate_cents, "subjects": req.subjects, "bio": req.bio}).eq("id", user.id).execute()
+        update_data = {
+            "hourly_rate_cents": req.hourly_rate_cents, 
+            "subjects": req.subjects, 
+            "bio": req.bio
+        }
+        
+        # Only update the link if they provided one
+        if req.meeting_link:
+            clean_link = req.meeting_link.replace("https://", "").replace("http://", "")
+            update_data["meeting_link"] = clean_link
+
+        supabase.table("users").update(update_data).eq("id", user.id).execute()
         return {"status": "Profile Updated"}
     except Exception as e: raise HTTPException(500, str(e))
 
