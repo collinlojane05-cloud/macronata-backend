@@ -215,15 +215,38 @@ def get_my_wallet(user = Depends(verify_token)):
         history = supabase.table("wallet_transactions").select("*").eq("wallet_id", user.id).order("created_at", desc=True).execute()
         return {"balance": wallet.data['balance_cents'], "locked": wallet.data.get('locked_balance_cents', 0), "history": history.data}
     except Exception as e: return {"balance": 0, "locked": 0, "history": []}
+# --- REPLACE THIS FUNCTION IN MAIN.PY ---
 
 @app.post("/confirm_deposit_simulated")
 def confirm_deposit_sim(req: DepositRequest, user = Depends(verify_token)):
-    # Simple top-up for testing
-    curr = supabase.table("wallets").select("balance_cents").eq("user_id", user.id).maybe_single().execute().data
-    current_bal = curr['balance_cents'] if curr else 0
-    supabase.table("wallets").update({"balance_cents": current_bal + req.amount_in_cents}).eq("user_id", user.id).execute()
-    supabase.table("wallet_transactions").insert({"wallet_id": user.id, "amount_cents": req.amount_in_cents, "transaction_type": "deposit", "description": "Top Up (Simulated)"}).execute()
-    return {"status": "Funds Added"}
+    try:
+        # 1. Check if wallet exists
+        res = supabase.table("wallets").select("balance_cents").eq("user_id", user.id).maybe_single().execute()
+        
+        if not res.data:
+            # 🚑 WALLET MISSING? CREATE IT NOW WITH THE FUNDS!
+            print(f"Creating new wallet for {user.id} with initial deposit.")
+            supabase.table("wallets").insert({
+                "user_id": user.id, 
+                "balance_cents": req.amount_in_cents
+            }).execute()
+        else:
+            # ✅ WALLET EXISTS? UPDATE IT.
+            new_bal = res.data['balance_cents'] + req.amount_in_cents
+            supabase.table("wallets").update({"balance_cents": new_bal}).eq("user_id", user.id).execute()
+            
+        # 2. Log the Transaction
+        supabase.table("wallet_transactions").insert({
+            "wallet_id": user.id, 
+            "amount_cents": req.amount_in_cents, 
+            "transaction_type": "deposit", 
+            "description": "Top Up (Simulated)"
+        }).execute()
+        
+        return {"status": "Funds Added"}
+    except Exception as e:
+        print(f"Deposit Error: {e}")
+        raise HTTPException(500, f"Deposit failed: {str(e)}")
 
 # --- ⏱️ SESSIONS & BOOKING ---
 @app.post("/book_with_wallet")
