@@ -361,6 +361,10 @@ def book_with_wallet(b: BookingRequest, user = Depends(verify_token)):
 
 # --- REPLACE THIS FUNCTION IN MAIN.PY ---
 
+# --- REPLACE THIS FUNCTION IN MAIN.PY ---
+
+from datetime import datetime, timezone # <--- MAKE SURE 'timezone' IS IMPORTED
+
 @app.post("/session_control")
 def control_session(ctrl: SessionControl, user = Depends(verify_token)):
     # 1. Fetch Session
@@ -368,38 +372,36 @@ def control_session(ctrl: SessionControl, user = Depends(verify_token)):
     if not s: raise HTTPException(404, "Session not found")
     
     if ctrl.action == "end":
-        # 🛡️ SAFETY CHECK: Did the session actually start?
+        # Check start time
         raw_start = s.get('start_time')
-        
-        # If no start time (Tutor forgot to click start), fallback to scheduled time
         if not raw_start:
             print("⚠️ Warning: Session ended but no start_time. Using scheduled_time.")
             raw_start = s.get('scheduled_time')
 
         if not raw_start:
-             # If both are missing, we can't charge. Just close it.
              supabase.table("sessions").update({"status": "completed"}).eq("id", ctrl.session_id).execute()
              return {"status": "Session Closed (No Cost Calculated)"}
 
-        # 2. Calculate Duration
-        start_time = datetime.fromisoformat(raw_start.replace('Z', ''))
-        end_time = datetime.now()
+        # 🕒 TIMEZONE FIX HERE -----------------------------------------
+        # 1. Convert DB string to UTC object
+        start_time = datetime.fromisoformat(raw_start.replace('Z', '+00:00'))
+        
+        # 2. Get current time as UTC (offset-aware)
+        end_time = datetime.now(timezone.utc)
+        # --------------------------------------------------------------
+
         duration_seconds = (end_time - start_time).total_seconds()
         
-        # Ensure duration is positive (in case of clock skew)
         if duration_seconds < 0: duration_seconds = 0
         
-        # 3. Calculate Cost
-        # Default rate to R150 if missing
+        # Calculate Cost
         rate = s.get('hourly_rate_cents') or 15000 
         cap = s.get('max_cost_cap_cents') or rate
         
         final_cost = int(duration_seconds * (rate / 3600.0))
-        
-        # Cap the cost (Safety: Don't charge more than the max agreed amount)
         final_cost = min(final_cost, cap) 
         
-        # 4. Move Money (Learner -> Tutor)
+        # Move Money
         l_wallet_res = supabase.table("wallets").select("*").eq("user_id", s['learner_id']).maybe_single().execute()
         l_wallet = l_wallet_res.data if l_wallet_res.data else {"balance_cents": 0}
 
@@ -412,17 +414,17 @@ def control_session(ctrl: SessionControl, user = Depends(verify_token)):
         else:
              t_balance = t_wallet_res.data['balance_cents']
 
-        # Execute Transfer
         supabase.table("wallets").update({"balance_cents": l_wallet['balance_cents'] - final_cost}).eq("user_id", s['learner_id']).execute()
         supabase.table("wallets").update({"balance_cents": t_balance + final_cost}).eq("user_id", pay_id).execute()
         
-        # 5. Update Session & Logs
+        # Update Session
         supabase.table("sessions").update({
             "status": "completed", 
             "end_time": end_time.isoformat(), 
             "final_cost_cents": final_cost
         }).eq("id", ctrl.session_id).execute()
         
+        # Log Transaction
         supabase.table("wallet_transactions").insert([
             {"wallet_id": s['learner_id'], "amount_cents": -final_cost, "transaction_type": "payment", "description": "Class Payment"},
             {"wallet_id": pay_id, "amount_cents": final_cost, "transaction_type": "earning", "description": "Class Earnings"}
@@ -431,7 +433,7 @@ def control_session(ctrl: SessionControl, user = Depends(verify_token)):
         return {"status": "Session Ended", "cost": final_cost}
     
     elif ctrl.action == "start":
-        # Simply mark it as live and save the time
-        now = datetime.now().isoformat()
+        # 🕒 TIMEZONE FIX HERE ALSO
+        now = datetime.now(timezone.utc).isoformat()
         supabase.table("sessions").update({"status": "live", "start_time": now}).eq("id", ctrl.session_id).execute()
         return {"status": "Started", "start_time": now}
