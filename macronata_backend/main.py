@@ -359,33 +359,69 @@ def book_with_wallet(b: BookingRequest, user = Depends(verify_token)):
     supabase.table("sessions").insert(data).execute()
     return {"msg": "Booking Successful"}
 
+# --- REPLACE THIS FUNCTION IN MAIN.PY ---
+
 @app.post("/session_control")
 def control_session(ctrl: SessionControl, user = Depends(verify_token)):
+    # 1. Fetch Session
     s = supabase.table("sessions").select("*").eq("id", ctrl.session_id).single().execute().data
     if not s: raise HTTPException(404, "Session not found")
     
     if ctrl.action == "end":
-        start_time = datetime.fromisoformat(s['start_time'].replace('Z', ''))
-        end_time = datetime.now()
-        duration = (end_time - start_time).total_seconds()
+        # 🛡️ SAFETY CHECK: Did the session actually start?
+        raw_start = s.get('start_time')
         
-        # Calculate Cost
-        final_cost = int(duration * (s['hourly_rate_cents'] / 3600.0))
-        final_cost = min(final_cost, s['max_cost_cap_cents']) # Cap it
-        
-        # Move Money (Learner -> Tutor)
-        l_wallet = supabase.table("wallets").select("*").eq("user_id", s['learner_id']).single().execute().data
-        pay_id = s.get('business_id') or s['tutor_id']
-        t_wallet = supabase.table("wallets").select("*").eq("user_id", pay_id).maybe_single().execute().data
-        
-        if not t_wallet:
-             supabase.table("wallets").insert({"user_id": pay_id, "balance_cents": 0}).execute()
-             t_wallet = {"balance_cents": 0}
+        # If no start time (Tutor forgot to click start), fallback to scheduled time
+        if not raw_start:
+            print("⚠️ Warning: Session ended but no start_time. Using scheduled_time.")
+            raw_start = s.get('scheduled_time')
 
-        supabase.table("wallets").update({"balance_cents": l_wallet['balance_cents'] - final_cost}).eq("user_id", s['learner_id']).execute()
-        supabase.table("wallets").update({"balance_cents": t_wallet['balance_cents'] + final_cost}).eq("user_id", pay_id).execute()
+        if not raw_start:
+             # If both are missing, we can't charge. Just close it.
+             supabase.table("sessions").update({"status": "completed"}).eq("id", ctrl.session_id).execute()
+             return {"status": "Session Closed (No Cost Calculated)"}
+
+        # 2. Calculate Duration
+        start_time = datetime.fromisoformat(raw_start.replace('Z', ''))
+        end_time = datetime.now()
+        duration_seconds = (end_time - start_time).total_seconds()
         
-        supabase.table("sessions").update({"status": "completed", "end_time": end_time.isoformat(), "final_cost_cents": final_cost}).eq("id", ctrl.session_id).execute()
+        # Ensure duration is positive (in case of clock skew)
+        if duration_seconds < 0: duration_seconds = 0
+        
+        # 3. Calculate Cost
+        # Default rate to R150 if missing
+        rate = s.get('hourly_rate_cents') or 15000 
+        cap = s.get('max_cost_cap_cents') or rate
+        
+        final_cost = int(duration_seconds * (rate / 3600.0))
+        
+        # Cap the cost (Safety: Don't charge more than the max agreed amount)
+        final_cost = min(final_cost, cap) 
+        
+        # 4. Move Money (Learner -> Tutor)
+        l_wallet_res = supabase.table("wallets").select("*").eq("user_id", s['learner_id']).maybe_single().execute()
+        l_wallet = l_wallet_res.data if l_wallet_res.data else {"balance_cents": 0}
+
+        pay_id = s.get('business_id') or s['tutor_id']
+        t_wallet_res = supabase.table("wallets").select("*").eq("user_id", pay_id).maybe_single().execute()
+        
+        if not t_wallet_res.data:
+             supabase.table("wallets").insert({"user_id": pay_id, "balance_cents": 0}).execute()
+             t_balance = 0
+        else:
+             t_balance = t_wallet_res.data['balance_cents']
+
+        # Execute Transfer
+        supabase.table("wallets").update({"balance_cents": l_wallet['balance_cents'] - final_cost}).eq("user_id", s['learner_id']).execute()
+        supabase.table("wallets").update({"balance_cents": t_balance + final_cost}).eq("user_id", pay_id).execute()
+        
+        # 5. Update Session & Logs
+        supabase.table("sessions").update({
+            "status": "completed", 
+            "end_time": end_time.isoformat(), 
+            "final_cost_cents": final_cost
+        }).eq("id", ctrl.session_id).execute()
         
         supabase.table("wallet_transactions").insert([
             {"wallet_id": s['learner_id'], "amount_cents": -final_cost, "transaction_type": "payment", "description": "Class Payment"},
@@ -395,5 +431,7 @@ def control_session(ctrl: SessionControl, user = Depends(verify_token)):
         return {"status": "Session Ended", "cost": final_cost}
     
     elif ctrl.action == "start":
-        supabase.table("sessions").update({"status": "live", "start_time": datetime.now().isoformat()}).eq("id", ctrl.session_id).execute()
-        return {"status": "Started"}
+        # Simply mark it as live and save the time
+        now = datetime.now().isoformat()
+        supabase.table("sessions").update({"status": "live", "start_time": now}).eq("id", ctrl.session_id).execute()
+        return {"status": "Started", "start_time": now}
