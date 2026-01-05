@@ -194,16 +194,43 @@ def get_learner_dashboard(user = Depends(verify_token)):
             "upcoming_sessions": []
         }
 
+# --- REPLACE THIS FUNCTION IN MAIN.PY ---
+
 @app.get("/tutor_dashboard")
 def get_tutor_dashboard(user = Depends(verify_token)):
     try:
+        # 1. Get Profile
         profile = supabase.table("users").select("*").eq("id", user.id).single().execute().data
-        sessions = supabase.table("sessions").select("*, learner:users!learner_id(full_name)").eq("tutor_id", user.id).order("scheduled_time").execute().data
+        
+        # 2. Get Real Wallet Balance (What they can withdraw)
+        wallet = supabase.table("wallets").select("balance_cents").eq("user_id", user.id).maybe_single().execute()
+        balance = wallet.data['balance_cents'] if wallet.data else 0
+
+        # 3. Get All Sessions (Ordered by newest first)
+        sessions_res = supabase.table("sessions").select("*, learner:users!learner_id(full_name)").eq("tutor_id", user.id).order("scheduled_time", desc=True).execute()
+        sessions = sessions_res.data if sessions_res.data else []
+        
+        # 4. Filter Data
         completed = [s for s in sessions if s['status'] == 'completed']
         upcoming = [s for s in sessions if s['status'] in ['scheduled', 'live']]
-        total_earnings = sum(s['final_cost_cents'] for s in completed)
-        return {"profile": profile, "stats": {"total_earnings_zar": total_earnings / 100, "completed_count": len(completed), "upcoming_count": len(upcoming)}, "upcoming_sessions": upcoming}
-    except Exception as e: raise HTTPException(500, str(e))
+        
+        # Calculate Total Lifetime Earnings (Just for stats)
+        total_earnings = sum((s.get('final_cost_cents') or 0) for s in completed)
+
+        return {
+            "profile": profile,
+            "wallet": {"balance_zar": balance / 100}, # Real withdrawable money
+            "stats": {
+                "total_earnings_zar": total_earnings / 100,
+                "completed_count": len(completed),
+                "upcoming_count": len(upcoming)
+            },
+            "upcoming_sessions": upcoming,
+            "past_sessions": completed # Full history list
+        }
+    except Exception as e: 
+        print(f"Tutor Dashboard Error: {e}")
+        raise HTTPException(500, str(e))
 
 # --- 🏢 BUSINESS DASHBOARD ---
 @app.get("/my_business_dashboard")
