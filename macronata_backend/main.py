@@ -324,16 +324,31 @@ def confirm_deposit_sim(req: DepositRequest, user = Depends(verify_token)):
         raise HTTPException(500, f"Deposit failed: {str(e)}")
 
 # --- ⏱️ SESSIONS & BOOKING ---
+# --- REPLACE IN MAIN.PY ---
+
 @app.post("/book_with_wallet")
 def book_with_wallet(b: BookingRequest, user = Depends(verify_token)):
-    # 1. Check Funds
+    # 1. Get Wallet Balance
     wallet_res = supabase.table("wallets").select("balance_cents").eq("user_id", user.id).maybe_single().execute()
-    wallet = wallet_res.data if wallet_res.data else {"balance_cents": 0}
     
-    if wallet['balance_cents'] < b.amount_in_cents:
-        raise HTTPException(402, "Insufficient Funds")
+    # Debug Logging 🖨️
+    print(f"--- BOOKING DEBUG ---")
+    print(f"User ID: {user.id}")
+    print(f"Wallet Found? {wallet_res.data}")
     
-    # 2. Book
+    current_balance = wallet_res.data['balance_cents'] if wallet_res.data else 0
+    cost_to_book = b.amount_in_cents
+    
+    print(f"💰 Balance: {current_balance}")
+    print(f"🧾 Cost: {cost_to_book}")
+    
+    # 2. The Check
+    if current_balance < cost_to_book:
+        print("❌ INSUFFICIENT FUNDS TRIGGERED")
+        raise HTTPException(402, f"Insufficient Funds. Balance: {current_balance}, Cost: {cost_to_book}")
+    
+    # 3. Book
+    print("✅ FUNDS OK. BOOKING...")
     data = {
         "tutor_id": b.tutor_id, "learner_id": user.id, 
         "scheduled_time": datetime.fromisoformat(b.scheduled_time.replace("Z", "")).isoformat(), 
