@@ -464,3 +464,29 @@ def control_session(ctrl: SessionControl, user = Depends(verify_token)):
         now = datetime.now(timezone.utc).isoformat()
         supabase.table("sessions").update({"status": "live", "start_time": now}).eq("id", ctrl.session_id).execute()
         return {"status": "Started", "start_time": now}
+    
+    # --- ADD THIS TO YOUR main.py FILE ---
+
+@app.get("/marketplace")
+def get_marketplace(query: Optional[str] = None):
+    # This endpoint is PUBLIC (No token required) so potential customers can browse.
+    try:
+        # Fetch users who are Tutors or Businesses
+        db_query = supabase.table("users").select("id, full_name, subjects, hourly_rate_cents, bio, role").in_("role", ["tutor", "business"])
+        
+        all_tutors = db_query.execute().data
+
+        # Simple Search Logic (Python-side filtering)
+        if query:
+            print(f"Searching for: {query}")
+            filtered = [
+                t for t in all_tutors 
+                if query.lower() in (t.get('full_name') or '').lower() 
+                or query.lower() in str(t.get('subjects') or '').lower()
+            ]
+            return filtered
+
+        return all_tutors
+    except Exception as e:
+        print(f"Marketplace Error: {e}")
+        return []
