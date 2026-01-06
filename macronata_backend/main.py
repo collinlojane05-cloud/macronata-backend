@@ -491,34 +491,35 @@ def get_marketplace(query: Optional[str] = None):
         print(f"Marketplace Error: {e}")
         return []
     
-    # --- ADD THIS TO MAIN.PY ---
+   # --- UPDATE THIS FUNCTION IN MAIN.PY ---
 
 @app.get("/public_profile/{user_id}")
 def get_public_profile(user_id: str):
     try:
-        # 1. Fetch Basic User Info
-        user = supabase.table("users").select("id, full_name, role, bio, subjects, hourly_rate_cents, verification_status, company_name, avatar_url").eq("id", user_id).maybe_single().execute()
+        # 1. Fetch Basic User Info (Using list mode to avoid 204 crash)
+        response = supabase.table("users").select("id, full_name, role, bio, subjects, hourly_rate_cents, verification_status, company_name, avatar_url").eq("id", user_id).execute()
         
-        if not user.data:
+        # Check if the list is empty
+        if not response.data or len(response.data) == 0:
+            print(f"User {user_id} not found in database.")
             raise HTTPException(404, "User not found")
         
-        profile = user.data
+        profile = response.data[0] # Take the first (and only) result
         
-        # 2. Fetch Stats (Classes taught, rating)
-        stats = {"classes_taught": 0, "rating": 5.0} # Defaults
+        # 2. Fetch Stats
+        stats = {"classes_taught": 0, "rating": 5.0}
         
         if profile['role'] in ['tutor', 'business']:
-            # Count completed sessions for this user
-            count = supabase.table("sessions").select("id", count="exact").eq("tutor_id", user_id).eq("status", "completed").execute()
-            stats['classes_taught'] = count.count
-            
-            # (Optional: Add real rating logic here later)
+            # Count completed sessions
+            # Note: We use count='exact' and head=True to just get the number, not the data
+            count_res = supabase.table("sessions").select("id", count="exact").eq("tutor_id", user_id).eq("status", "completed").execute()
+            stats['classes_taught'] = count_res.count if count_res.count else 0
 
         return {"profile": profile, "stats": stats}
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
         print(f"Profile Error: {e}")
-        # If it's already a 404 (User not found), re-raise it
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(500, "Could not load profile")
+        # Return a generic 404 if anything weird happens to avoid UI crashing
+        raise HTTPException(404, "Profile not accessible")
