@@ -490,3 +490,35 @@ def get_marketplace(query: Optional[str] = None):
     except Exception as e:
         print(f"Marketplace Error: {e}")
         return []
+    
+    # --- ADD THIS TO MAIN.PY ---
+
+@app.get("/public_profile/{user_id}")
+def get_public_profile(user_id: str):
+    try:
+        # 1. Fetch Basic User Info
+        user = supabase.table("users").select("id, full_name, role, bio, subjects, hourly_rate_cents, verification_status, company_name, avatar_url").eq("id", user_id).maybe_single().execute()
+        
+        if not user.data:
+            raise HTTPException(404, "User not found")
+        
+        profile = user.data
+        
+        # 2. Fetch Stats (Classes taught, rating)
+        stats = {"classes_taught": 0, "rating": 5.0} # Defaults
+        
+        if profile['role'] in ['tutor', 'business']:
+            # Count completed sessions for this user
+            count = supabase.table("sessions").select("id", count="exact").eq("tutor_id", user_id).eq("status", "completed").execute()
+            stats['classes_taught'] = count.count
+            
+            # (Optional: Add real rating logic here later)
+
+        return {"profile": profile, "stats": stats}
+
+    except Exception as e:
+        print(f"Profile Error: {e}")
+        # If it's already a 404 (User not found), re-raise it
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(500, "Could not load profile")
